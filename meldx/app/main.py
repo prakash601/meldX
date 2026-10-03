@@ -5,6 +5,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from sqlalchemy.exc import SQLAlchemyError
 
+from meldx.app import bus
+from meldx.app.api import events
 from meldx.app.db import check_db, get_engine
 from meldx.app.mcp.tools import mcp as mcp_server
 
@@ -16,10 +18,10 @@ mcp_app = mcp_server.streamable_http_app()
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     get_engine()  # fail fast on bad DATABASE_URL
+    bus.init_bus()  # fresh event queue per boot
     # Mounted sub-apps don't get their lifespan run — nest it manually so the
     # streamable-HTTP task group starts.
     async with mcp_app.router.lifespan_context(mcp_app):
-        # P4: create shared event_queue (asyncio.Queue)
         yield
 
 
@@ -35,11 +37,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=503, detail="db unreachable") from None
         return {"ok": True}
 
-    # MCP Streamable HTTP for ChatGPT/OpenCode/Hermes
+    # API routes BEFORE the "/" mount: a root mount matches every path,
+    # so anything registered after it would be unreachable.
+    app.include_router(events.router, prefix="/api")
+
+    # MCP Streamable HTTP for ChatGPT/OpenCode/Hermes (inner route /mcp)
     app.mount("/", mcp_app)
 
-    # P4: app.include_router(events.router, prefix="/api")
     # P5: app.include_router(tasks.router, prefix="/api/tasks") + web router
+    # (also before the mount)
     return app
 
 

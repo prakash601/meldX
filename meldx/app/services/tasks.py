@@ -12,6 +12,7 @@ import dateparser
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from meldx.app import bus
 from meldx.app.models import Agent, AgentStatus, AgentType, Priority, Task, TaskStatus
 
 LOCKED_MSG = "Task locked or not found"
@@ -105,6 +106,7 @@ async def create_task(
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    bus.publish("task.created", task)
     return task
 
 
@@ -128,8 +130,14 @@ async def list_tasks(
 
 
 async def claim_task(session: AsyncSession, *, task_id: str, agent_id: str) -> Task:
-    """Exclusive claim. FOR UPDATE SKIP LOCKED wins races on PG (no-op on sqlite)."""
+    """Exclusive claim. FOR UPDATE SKIP LOCKED wins races on PG (no-op on sqlite).
+
+    Agent row is ensured BEFORE the locked read: ensure_agent commits, and any
+    commit between SELECT FOR UPDATE and the final commit would release the
+    row lock early and reopen the race.
+    """
     tid = _coerce_id(task_id)
+    await ensure_agent(session, agent_id)
     stmt = select(Task).where(col(Task.id) == tid).with_for_update(skip_locked=True)
     task = (await session.exec(stmt)).first()
     if task is None:
@@ -138,7 +146,6 @@ async def claim_task(session: AsyncSession, *, task_id: str, agent_id: str) -> T
     lease = _aware(task.lease_expires_at)
     if lease is not None and lease > now and task.agent_id != agent_id:
         raise ValueError(f"Task leased to {task.agent_id} until {lease.isoformat()}")
-    await ensure_agent(session, agent_id)
     task.status = TaskStatus.doing
     task.agent_id = agent_id
     task.lease_expires_at = now + timedelta(minutes=lease_minutes())
@@ -146,6 +153,7 @@ async def claim_task(session: AsyncSession, *, task_id: str, agent_id: str) -> T
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    bus.publish("task.claimed", task)
     return task
 
 
@@ -160,6 +168,7 @@ async def complete_task(session: AsyncSession, *, task_id: str) -> Task:
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    bus.publish("task.completed", task)
     return task
 
 
@@ -182,6 +191,7 @@ async def update_task(
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    bus.publish("task.updated", task)
     return task
 
 
@@ -199,6 +209,7 @@ async def handoff_task(
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    bus.publish("task.updated", task)
     return task
 
 
@@ -212,4 +223,5 @@ async def snooze_task(session: AsyncSession, *, task_id: str, until: str) -> Tas
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    bus.publish("task.updated", task)
     return task
