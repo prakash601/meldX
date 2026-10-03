@@ -1,0 +1,42 @@
+name: pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p _site
+          {
+            echo "<!doctype html><html><head><meta charset='utf-8'>"
+            echo "<title>meldX docs</title></head><body><h1>meldX docs</h1><ul>"
+            for f in README.md PROJECT_SPEC.md docs/*.md; do
+              [ -f "$f" ] || continue
+              echo "<li><a href='$f'>$f</a></li>"
+            done
+            echo "</ul><p>Raw markdown served via Pages. See repo for full docs.</p></body></html>"
+          } > _site/index.html
+          cp README.md PROJECT_SPEC.md _site/ 2>/dev/null || true
+          mkdir -p _site/docs && cp docs/*.md _site/docs/ 2>/dev/null || true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
