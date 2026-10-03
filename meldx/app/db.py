@@ -5,6 +5,7 @@ Tests never touch it — they monkeypatch to sqlite (see tests/).
 """
 import os
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -36,6 +37,12 @@ def reset_engine() -> None:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
+    async with session_scope() as session:
+        yield session
+
+
+@asynccontextmanager
+async def session_scope() -> AsyncIterator[AsyncSession]:
     maker = async_sessionmaker(get_engine(), class_=AsyncSession, expire_on_commit=False)
     async with maker() as session:
         yield session
