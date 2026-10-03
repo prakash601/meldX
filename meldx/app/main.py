@@ -1,13 +1,15 @@
-"""P1 skeleton: boots with /health. DB/MCP/API/Web mount in P2-P5."""
+"""P2: boots with /health backed by SELECT 1. DB/MCP/API/Web mount in P3-P5."""
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
+
+from meldx.app.db import check_db
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # P2: init async engine + SELECT 1 check
     # P3: mount MCP app at /mcp
     # P4: create shared event_queue (asyncio.Queue)
     yield
@@ -19,6 +21,10 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, bool]:
+        try:
+            await check_db()
+        except (OSError, SQLAlchemyError):
+            raise HTTPException(status_code=503, detail="db unreachable") from None
         return {"ok": True}
 
     # P3: app.mount("/mcp", mcp_app)
