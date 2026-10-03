@@ -1,0 +1,13 @@
+<article id="task-{{ task.id }}" class="rounded-xl border border-slate-800 bg-slate-900 p-5">
+  <div class="flex justify-between gap-3 items-start">
+    <h3 class="font-medium break-words">{{ task.title }}</h3>
+    <span class="text-xs rounded-full px-2 py-1 {% if task.priority.value == 'high' %}bg-rose-950 text-rose-300{% elif task.priority.value == 'med' %}bg-amber-950 text-amber-300{% else %}bg-slate-800 text-slate-400{% endif %}">{{ task.priority.value }}</span>
+  </div>
+  {% if task.description %}<p class="text-sm text-slate-400 mt-3 whitespace-pre-wrap break-words">{{ task.description }}</p>{% endif %}
+  {% if task.agent_id %}<p class="text-xs text-teal-300 mt-3">{{ task.agent_id }}</p>{% endif %}
+  {% if task.lease_expires_at %}<time datetime="{{ task.lease_expires_at.isoformat() }}" data-lease="{{ task.lease_expires_at.isoformat() }}{% if not task.lease_expires_at.tzinfo %}+00:00{% endif %}" class="block text-xs text-amber-300 mt-2">⏳ Calculating lease…</time>{% endif %}
+  <div class="flex gap-3 mt-4">
+    <button hx-post="/tasks/{{ task.id }}/claim" hx-include="#agent-id" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Claim</button>
+    <button hx-post="/tasks/{{ task.id }}/complete" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg bg-teal-950 text-teal-300 px-3 py-2">Complete</button>
+  </div>
+</article>

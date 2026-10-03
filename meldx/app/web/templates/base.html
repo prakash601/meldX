@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Today · meldX</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js" integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/htmx-ext-sse@2.2.4" integrity="sha384-A986SAtodyH8eg8x8irJnYUk7i9inVQqYigD6qZ9evobksGNIXfeFvDwLSHcp31N" crossorigin="anonymous"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <main class="max-w-6xl mx-auto px-6 py-10" hx-ext="sse" sse-connect="/api/events">
+    <header class="flex justify-between items-center mb-8">
+      <div><p class="text-teal-400 font-semibold tracking-widest">meldX</p>
+        <h1 class="text-4xl font-semibold mt-2">Today</h1>
+        <p class="text-slate-400 mt-2">One queue. Clear ownership. Keep moving.</p></div>
+      <span id="connection" role="status" class="text-sm text-slate-400">Connecting…</span>
+    </header>
+    <p id="error" role="alert" class="text-rose-300 mb-4" hidden></p>
+    {% block content %}{% endblock %}
+  </main>
+  <script>
+    function countdowns() {
+      document.querySelectorAll('[data-lease]').forEach(el => {
+        const remaining = Math.max(0, Math.ceil((Date.parse(el.dataset.lease) - Date.now()) / 1000));
+        el.textContent = remaining ? `⏳ ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}` : 'Lease expired · claimable';
+      });
+    }
+    countdowns();
+    setInterval(countdowns, 1000);
+    document.body.addEventListener('htmx:afterSwap', countdowns);
+    document.body.addEventListener('htmx:sseOpen', () => {
+      document.getElementById('connection').textContent = '● Live';
+      // Refresh on every connection, including reconnects, to recover missed events.
+      htmx.trigger('#task-board', 'refresh');
+    });
+    document.body.addEventListener('htmx:sseError', () => {
+      document.getElementById('connection').textContent = 'Reconnecting…';
+    });
+    document.body.addEventListener('htmx:responseError', event => {
+      const error = document.getElementById('error');
+      let message = 'Request failed. Please try again.';
+      try { message = JSON.parse(event.detail.xhr.responseText).detail || message; } catch (_) {}
+      error.textContent = typeof message === 'string' ? message : 'Check the form values and try again.';
+      error.hidden = false;
+    });
+    document.body.addEventListener('htmx:afterRequest', event => {
+      if (event.detail.successful) {
+        document.getElementById('error').hidden = true;
+        if (event.detail.elt.id === 'add-task') event.detail.elt.reset();
+      }
+    });
+  </script>
+</body>
+</html>

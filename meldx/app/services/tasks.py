@@ -18,6 +18,14 @@ from meldx.app.models import Agent, AgentStatus, AgentType, Priority, Task, Task
 LOCKED_MSG = "Task locked or not found"
 
 
+class TaskNotFound(ValueError):
+    """Missing or invalid task ID, retaining the MCP message contract."""
+
+
+class TaskLocked(ValueError):
+    """Existing task is currently locked by another transaction."""
+
+
 def lease_minutes() -> int:
     try:
         return int(os.environ.get("LEASE_MINUTES", "30"))
@@ -55,13 +63,13 @@ def _coerce_id(task_id: str) -> UUID:
     try:
         return UUID(task_id)
     except (ValueError, AttributeError):
-        raise ValueError(LOCKED_MSG) from None
+        raise TaskNotFound(LOCKED_MSG) from None
 
 
 async def _get_or_locked(session: AsyncSession, task_id: UUID) -> Task:
     task = await session.get(Task, task_id)
     if task is None:
-        raise ValueError(LOCKED_MSG)
+        raise TaskNotFound(LOCKED_MSG)
     return task
 
 
@@ -141,7 +149,9 @@ async def claim_task(session: AsyncSession, *, task_id: str, agent_id: str) -> T
     stmt = select(Task).where(col(Task.id) == tid).with_for_update(skip_locked=True)
     task = (await session.exec(stmt)).first()
     if task is None:
-        raise ValueError(LOCKED_MSG)
+        if await session.get(Task, tid) is None:
+            raise TaskNotFound(LOCKED_MSG)
+        raise TaskLocked(LOCKED_MSG)
     now = _now()
     lease = _aware(task.lease_expires_at)
     if lease is not None and lease > now and task.agent_id != agent_id:

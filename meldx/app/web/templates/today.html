@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<form id="add-task" hx-post="/tasks" hx-target="#task-board" hx-swap="innerHTML" class="flex gap-3 mb-6">
+  <label for="title" class="sr-only">Task title</label>
+  <input id="title" name="title" required maxlength="300" placeholder="What needs doing?" class="flex-1 rounded-xl bg-slate-900 border border-slate-700 px-4 py-3">
+  <button class="rounded-xl bg-teal-400 text-slate-950 font-semibold px-5">Add task</button>
+</form>
+<div class="flex items-center gap-3 mb-8">
+  <label for="agent-id" class="text-sm text-slate-400">Claim tasks as</label>
+  <input id="agent-id" name="agent_id" value="codex-1" required class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
+</div>
+<div id="task-board" hx-get="/partials/tasks" hx-trigger="refresh, sse:task.created, sse:task.claimed, sse:task.completed, sse:task.updated" hx-swap="innerHTML" hx-sync="this:queue last">
+  {% include "partials/task_groups.html" %}
+</div>
+{% endblock %}
