@@ -36,7 +36,3 @@ jobs:
           (uv run uvicorn meldx.app.main:app --port 8001 > /tmp/uvicorn.log 2>&1 &)
           sleep 4
           curl -sf http://localhost:8001/health
-      - run: |
-          (uv run uvicorn meldx.app.main:app --port 8001 > /tmp/uvicorn.log 2>&1 &)
-          sleep 4
-          curl -sf http://localhost:8001/health
