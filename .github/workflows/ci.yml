@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run mypy meldx
+      - run: uv run pytest -q
+      - run: |
+          (uv run uvicorn meldx.app.main:app --port 8001 > /tmp/uvicorn.log 2>&1 &)
+          sleep 4
+          curl -sf http://localhost:8001/health
