@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+.env
+alembic/__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+render.yaml.local
+
+# local agent scratch (never commit)
+agent.md
+
+# TEMP HOLD: docs not ready to publish — remove when approved
+README.md
+PROJECT_SPEC.md
+AGENTS.md
+docs/
