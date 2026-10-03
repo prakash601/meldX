@@ -37,3 +37,25 @@ jobs:
           (uv run uvicorn meldx.app.main:app --port 8001 > /tmp/uvicorn.log 2>&1 &)
           sleep 4
           curl -sf http://localhost:8001/health
+      - name: Docker and installed CLI smoke check
+        env:
+          API: http://localhost:8002
+        run: |
+          docker build -t meldx:ci .
+          docker run --detach --name meldx-smoke --network host \
+            -e DATABASE_URL -e PORT=8002 -e RENDER_EXTERNAL_HOSTNAME=meldx.onrender.com meldx:ci
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl -fsS "$API/health"; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != 1 ]; then docker logs meldx-smoke; exit 1; fi
+          uv run meldx add "CI CLI smoke" --due today --priority high
+          uv run meldx list --today --json
+      - name: Container logs and cleanup
+        if: always()
+        run: |
+          if docker inspect meldx-smoke >/dev/null 2>&1; then
+            docker logs meldx-smoke
+            docker rm -f meldx-smoke
+          fi

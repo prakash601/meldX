@@ -21,6 +21,9 @@ dependencies = [
   "greenlet>=3.5.6",
 ]
 
+[project.scripts]
+meldx = "meldx.app.cli.main:app"
+
 [dependency-groups]
 dev = [
   "pytest>=8.0",

@@ -2,9 +2,10 @@ services:
   - type: web
     name: meldx
     runtime: docker
+    plan: free
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
-    startCommand: uvicorn meldx.app.main:app --host 0.0.0.0 --port $PORT
+    # Docker CMD runs migrations then binds to Render's PORT with one worker.
     envVars:
       - key: DATABASE_URL
         sync: false
