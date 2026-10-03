@@ -22,6 +22,7 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgresql+asyncpg://meldx:meldx@localhost:5432/meldx
+      DATABASE_URL_TEST: postgresql+asyncpg://meldx:meldx@localhost:5432/meldx
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3

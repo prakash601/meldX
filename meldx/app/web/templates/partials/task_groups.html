@@ -1,0 +1,11 @@
+<div class="grid md:grid-cols-3 gap-6">
+{% for status, tasks in groups.items() %}
+  <section aria-labelledby="heading-{{ status }}" data-group="{{ status }}">
+    <h2 id="heading-{{ status }}" class="text-lg font-semibold mb-4 capitalize">{{ status }} <span class="text-slate-500 text-sm">{{ tasks|length }}</span></h2>
+    <div class="space-y-3">
+      {% for task in tasks %}{% include "partials/task_card.html" %}
+      {% else %}<p class="rounded-xl border border-dashed border-slate-800 p-6 text-sm text-slate-500">Nothing here yet.</p>{% endfor %}
+    </div>
+  </section>
+{% endfor %}
+</div>

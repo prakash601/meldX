@@ -3,6 +3,7 @@
 Single source of truth for Postgres tables + API schemas + MCP schemas.
 Spec: docs/data-model.md (local-only for now).
 """
+
 import enum
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -50,7 +51,43 @@ class Agent(SQLModel, table=True):
     last_seen: datetime = Field(default_factory=_utcnow)
 
 
-class Task(SQLModel, table=True):
+class TaskFields(SQLModel):
+    title: str = Field(min_length=1, max_length=300)
+    description: str | None = None
+    priority: Priority = Field(default=Priority.med)
+
+
+class TaskCreate(TaskFields):
+    due_at: str | None = None
+    delegate_to: str | None = Field(default=None, min_length=1)
+
+
+class TaskUpdate(SQLModel):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    description: str | None = None
+    priority: Priority | None = None
+
+
+class TaskClaim(SQLModel):
+    agent_id: str = Field(min_length=1)
+
+
+class TaskHandoff(SQLModel):
+    to_agent: str = Field(min_length=1)
+    note: str | None = None
+
+
+class TaskSnooze(SQLModel):
+    until: str = Field(min_length=1)
+
+
+class AgentUpsert(SQLModel):
+    id: str = Field(min_length=1)
+    type: AgentType
+    status: AgentStatus = AgentStatus.idle
+
+
+class Task(TaskFields, table=True):
     __tablename__ = "tasks"
     __table_args__ = (
         Index("ix_tasks_status_due", "status", "due_at"),
@@ -58,10 +95,7 @@ class Task(SQLModel, table=True):
     )
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
-    title: str = Field(min_length=1, max_length=300)
-    description: str | None = None
     status: TaskStatus = Field(default=TaskStatus.inbox)
-    priority: Priority = Field(default=Priority.med)
     agent_id: str | None = Field(default=None, foreign_key="agents.id")
     lease_expires_at: datetime | None = Field(default=None)
     due_at: datetime | None = None
