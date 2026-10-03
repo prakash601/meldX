@@ -2,11 +2,14 @@
 
 import json
 import logging
+import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy.exc import SQLAlchemyError
 
 from meldx.app import bus
@@ -38,9 +41,18 @@ def configure_logging() -> None:
         logger.setLevel(logging.INFO)
 
 
-# Inner route is /mcp (SDK default). Mounted at "/" so POST /mcp hits it
-# directly with no slash-redirect; outer routes are matched first.
-mcp_app = mcp_server.streamable_http_app()
+def mcp_transport_security() -> TransportSecuritySettings:
+    """Accept explicit deployment hosts while retaining DNS rebinding protection."""
+    hosts = ["localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*", "[::1]", "[::1]:*"]
+    origins = ["http://localhost:*", "http://127.0.0.1:*", "http://[::1]:*"]
+    for key in ("RENDER_EXTERNAL_HOSTNAME", "MCP_HOSTNAME"):
+        hostname = os.environ.get(key)
+        if hostname:
+            if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", hostname):
+                raise ValueError(f"{key} must contain a hostname without a scheme or port")
+            hosts.extend([hostname, f"{hostname}:443"])
+            origins.append(f"https://{hostname}")
+    return TransportSecuritySettings(allowed_hosts=hosts, allowed_origins=origins)
 
 
 @asynccontextmanager
@@ -50,12 +62,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     bus.init_bus()  # fresh event queue per boot
     # Mounted sub-apps don't get their lifespan run — nest it manually so the
     # streamable-HTTP task group starts.
-    async with mcp_app.router.lifespan_context(mcp_app):
+    async with app.state.mcp_app.router.lifespan_context(app.state.mcp_app):
         yield
 
 
 def create_app() -> FastAPI:
+    mcp_app = mcp_server.streamable_http_app(transport_security=mcp_transport_security())
     app = FastAPI(title="meldX")
+    app.state.mcp_app = mcp_app
     app.router.lifespan_context = lifespan
 
     @app.get("/health")
@@ -64,6 +78,9 @@ def create_app() -> FastAPI:
             await check_db()
         except (OSError, SQLAlchemyError):
             raise HTTPException(status_code=503, detail="db unreachable") from None
+        logging.getLogger("meldx.db").info(
+            "SELECT 1 ok", extra={"event": "db.select_1", "status": "ok"}
+        )
         return {"ok": True}
 
     @app.exception_handler(ValueError)

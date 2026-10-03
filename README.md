@@ -8,10 +8,10 @@ Jinja2, HTMX. Dependencies are managed with uv; no frontend build step.
 
 ## Status
 
-P1–P4 are merged. P5 implements the REST mirror and Today view; its acceptance checklist
-is in [docs/plan.md](docs/plan.md#p5-web--api). P6 (CLI, Render deployment, and
-ChatGPT Connector verification) is next. Docker and Render configuration exist;
-production deployment and Connector round-trip are not yet verified.
+P1–P5 are merged. P6 adds the CLI and tested Docker/Render deployment configuration.
+Production deployment and the ChatGPT Connector round-trip are deferred, so
+[issue #6](https://github.com/prakash601/meldX/issues/6) remains open.
+See [the phase checklist](docs/plan.md#p6-cli--deploy) and [deployment guide](docs/deploy.md).
 
 ## Run locally
 
@@ -30,6 +30,25 @@ Open `http://localhost:8000/`. Add a task, choose the agent ID to claim as, then
 or Complete. Inbox, Today, and Doing are grouped; done and snoozed tasks are hidden.
 Agent badges, priorities, descriptions, and remaining leases appear on each card.
 HTMX, its SSE extension, and Tailwind load from CDNs.
+
+## CLI
+
+The installed `meldx` command talks to the REST API. `API` defaults to
+`http://localhost:8000`; set it to another local port or the deployed HTTPS URL.
+
+```sh
+uv run meldx add "write report" --description "Q3" --due tomorrow --priority high
+uv run meldx add "review report" --delegate hermes-1
+uv run meldx list --today
+uv run meldx list --status doing --json
+uv run meldx claim <task-uuid> --agent codex-1
+uv run meldx done <task-uuid>
+API=http://localhost:8015 uv run meldx list
+```
+
+Add, claim, and done print the returned task as JSON. List uses a Rich table;
+`--json` gives IDs and fields for scripting. API, validation, and network failures
+exit nonzero with an error on stderr. Requests use a 60-second timeout.
 
 ## Interfaces
 
@@ -73,3 +92,31 @@ database is unreachable; SQLite tests alone do not prove Postgres locking.
 P5 validation: 23 tests passed with a dedicated local Postgres database, Ruff and strict
 mypy passed, and `alembic check` reported no schema changes. Two real browser tabs
 verified create → claim → complete updates, lease countdowns, and lease conflict feedback.
+
+## Docker, Render, and ChatGPT
+
+```sh
+docker build -t meldx .
+# Use your development Postgres URL; host.docker.internal reaches the Mac host.
+docker run --rm -p 8000:8000 \
+  -e DATABASE_URL='postgresql+asyncpg://meldx:meldx@host.docker.internal:5432/meldx' meldx
+```
+
+The container installs locked dependencies, includes Alembic migrations, runs
+`alembic upgrade head` before serving, and binds one uvicorn worker to `PORT`
+(default 8000). A migration failure stops startup. Secrets and Git data are excluded
+from the image build context.
+
+Render uses [render.yaml](render.yaml) and the Dockerfile's command, with `/health`
+as its readiness check. Configure `DATABASE_URL` directly in Render. Render's
+`RENDER_EXTERNAL_HOSTNAME` is accepted by MCP; set `MCP_HOSTNAME` for a custom domain.
+The MCP transport still validates Host and Origin headers.
+
+The ChatGPT connection will use `https://<actual-render-host>/mcp`. Follow the
+[deployment guide](docs/deploy.md) and [official connection instructions](https://developers.openai.com/plugins/deploy/connect-chatgpt).
+
+P6 local validation: 40 tests passed with dedicated Postgres; Ruff and strict mypy
+passed. The Docker image applied migrations, served health/web on `PORT=10000`,
+and passed a CLI add/list/claim/conflict/done round-trip. MCP initialization, seven-tool
+listing, and create/list/complete passed using a Render Host header. These checks do
+not establish a production deployment or a real ChatGPT connection.

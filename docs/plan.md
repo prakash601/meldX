@@ -1,6 +1,6 @@
 # Build plan — 6 phases (agent-runnable)
 
-> Status: P1-P4 merged; P5 implemented and locally verified (23 tests including Postgres, Ruff, strict mypy, two-tab browser checks). P6 pending.
+> Status: P1-P5 merged; P6 CLI and deployment preparation implemented and locally verified. Production deployment and ChatGPT connection deferred by the user.
 
 > Each phase: Files / Commands / Acceptance. Copy Prompt 1 → OpenCode (P1-P3), Prompt 2 → Hermes (P4-P5), Prompt 3 → Codex (P6).
 
@@ -66,17 +66,29 @@
 P1-P4 historical command checkboxes below/above are not a fresh claim of Neon or
 manual MCP Inspector verification. P5 validation used local dedicated Postgres.
 
-## P6 CLI + Deploy (1h)
-**Files:** `meldx/app/cli/main.py` (`meldx add/list/done/claim`), `Dockerfile`, `render.yaml`, `README` connector section
-**Commands:**
-- [ ] `uv run meldx add "test from cli" --due tomorrow --priority high`
-- [ ] `uv run meldx list --today && uv run meldx done <id>`
-- [ ] Add `render.yaml` web service (`healthCheckPath: /health`, start `uvicorn meldx.app.main:app --host 0.0.0.0 --port $PORT`), set `DATABASE_URL` (Neon) in Render dashboard, deploy
-- [ ] Add `https://<app>.onrender.com/mcp` as ChatGPT Connector, call `todo_list`
-**Acceptance:**
-- [ ] CLI works against local + Render URL (`API=https://<app>.onrender.com`)
-- [ ] Render dashboard healthy, `/health` 200 in prod
-- [ ] ChatGPT `todo_create`/`todo_list` round-trip via Connector
+## P6 CLI + Deploy
+
+[Issue #6](https://github.com/prakash601/meldX/issues/6)
+
+- [x] Typer `meldx add/list/done/claim` entry point installed through pyproject.
+- [x] CLI uses async httpx, API environment variable, Rich output, nonzero errors.
+- [x] Local CLI add/list/claim/conflict/done round-trip against the Docker server.
+- [x] Locked Docker build includes source and migrations; excludes secrets and Git.
+- [x] Container runs migrations, binds to PORT, and serves one worker.
+- [x] Render blueprint uses Docker startup, `/health`, and DATABASE_URL secret configuration.
+- [x] MCP Host/Origin validation supports Render and custom hostnames.
+- [x] Container `/health` returns 200 after SELECT 1; web and MCP round-trips pass.
+- [x] `pytest -q`: 40 passed including Postgres race tests, CLI and deployed-host contracts.
+- [x] Ruff and strict mypy pass; Docker/installed CLI smoke checks added to CI.
+- [x] [Deployment and ChatGPT connection guide](deploy.md) documents remaining checks.
+- [ ] Render production deployment healthy, `/health` 200, migration/health logs verified.
+- [ ] CLI `API=https://<actual-render-host>` list/add/claim/done verified in production.
+- [ ] Real ChatGPT connection can list → create → complete through `/mcp`.
+- [ ] PROJECT_SPEC v1 acceptance verified against production.
+
+Production and ChatGPT verification were explicitly deferred. Keep #6 open until
+these checks pass; local container evidence alone does not complete v1 deployment.
+
 
 ---
 **Prompts to copy:**
