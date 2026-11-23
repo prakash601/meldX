@@ -25,10 +25,12 @@ async def test_tables_columns_indexes() -> None:
             "id", "title", "description", "status", "priority", "agent_id",
             "lease_expires_at", "due_at", "parent_id",
             "created_at", "updated_at", "completed_at",
+            "lifecycle", "progress", "revision",
         }
         idx_names = {i["name"] for i in insp.get_indexes("tasks")}
         assert "ix_tasks_status_due" in idx_names
         assert "ix_tasks_lease" in idx_names
+        assert "ix_tasks_lifecycle_progress" in idx_names
 
         fks = {
             (fk["referred_table"], tuple(fk["referred_columns"]))
@@ -49,6 +51,10 @@ def test_task_defaults() -> None:
     assert t.agent_id is None
     assert t.lease_expires_at is None
     assert t.id is not None
+    # ADR-004 v0.0.1 foundation
+    assert t.lifecycle == "open"
+    assert t.progress == "ready"
+    assert t.revision == 1
 
     a = Agent(id="opencode-1", type="opencode")
     assert a.status == "idle"
