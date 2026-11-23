@@ -13,6 +13,9 @@ from meldx.app.models import TaskStatus
 from meldx.app.services import tasks as svc
 
 router = APIRouter()
+# Agent-execution form action (claim): registered only when
+# ENABLE_AGENT_EXECUTION is set — see main.create_app (product plan §6.1).
+execution_router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 Session = Annotated[AsyncSession, Depends(get_session)]
 
@@ -23,7 +26,14 @@ async def board(request: Request, session: AsyncSession, template: str) -> HTMLR
         status.value: [t for t in tasks if t.status == status]
         for status in (TaskStatus.inbox, TaskStatus.today, TaskStatus.doing)
     }
-    return templates.TemplateResponse(request=request, name=template, context={"groups": groups})
+    return templates.TemplateResponse(
+        request=request,
+        name=template,
+        context={
+            "groups": groups,
+            "agent_execution": getattr(request.app.state, "agent_execution", False),
+        },
+    )
 
 
 @router.get(
@@ -62,7 +72,7 @@ async def add_task(
     return await board(request, session, "partials/task_groups.html")
 
 
-@router.post(
+@execution_router.post(
     "/tasks/{task_id}/claim",
     response_class=HTMLResponse,
     tags=["web"],

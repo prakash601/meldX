@@ -4,7 +4,9 @@ import pytest
 
 from meldx.app.main import create_app
 
-SPEC = create_app().openapi()
+# The full contract, including the opt-in execution routes. The default
+# (standalone) surface is pinned separately below.
+SPEC = create_app(enable_agent_execution=True).openapi()
 
 
 def test_info_has_description_and_version() -> None:
@@ -59,3 +61,16 @@ def test_health_documents_unreachable_database() -> None:
     health = SPEC["paths"]["/health"]["get"]
     assert health["tags"] == ["health"]
     assert "503" in health["responses"]
+
+
+def test_default_surface_excludes_execution_routes() -> None:
+    """Standalone personal service (flags off): claim/handoff are not even routed."""
+    paths = create_app().openapi()["paths"]
+    assert "/api/tasks/{task_id}/claim" not in paths
+    assert "/api/tasks/{task_id}/handoff" not in paths
+    assert paths  # the personal surface itself is still fully present
+
+
+def test_execution_surface_includes_claim_and_handoff() -> None:
+    assert "/api/tasks/{task_id}/claim" in SPEC["paths"]
+    assert "/api/tasks/{task_id}/handoff" in SPEC["paths"]

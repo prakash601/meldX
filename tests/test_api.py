@@ -24,7 +24,8 @@ async def client(tmp_path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Asy
         await connection.run_sync(SQLModel.metadata.create_all)
     await engine.dispose()
     async with AsyncClient(
-        transport=ASGITransport(app=create_app()), base_url="http://localhost"
+        transport=ASGITransport(app=create_app(enable_agent_execution=True)),
+        base_url="http://localhost",
     ) as instance:
         yield instance
     await db.get_engine().dispose()

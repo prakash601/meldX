@@ -112,7 +112,7 @@ async def test_seven_tools_registered() -> None:
 
 def test_http_mount_lists_tools(db_file: str) -> None:
     """End-to-end Streamable HTTP: initialize -> tools/list -> tools/call."""
-    app = create_app()
+    app = create_app(enable_mcp=True)
     transport = ASGITransport(app=app)  # route registered (lifespan covered below)
     assert any(getattr(r, "path", "") in ("/", "") for r in app.routes)
 
