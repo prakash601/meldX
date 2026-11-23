@@ -83,6 +83,8 @@ def test_list_filters_and_json(mock_api) -> None:
     "command,payload,path",
     [
         (["done", TID], None, f"/api/tasks/{TID}/complete"),
+        (["start", TID], None, f"/api/tasks/{TID}/start"),
+        (["reopen", TID], None, f"/api/tasks/{TID}/reopen"),
         (["claim", TID, "--agent", "codex-1"], {"agent_id": "codex-1"}, f"/api/tasks/{TID}/claim"),
     ],
 )
@@ -115,6 +117,46 @@ def test_api_errors_exit_nonzero(mock_api, status, detail) -> None:
     assert f"HTTP {status}" in result.stderr
     assert str(detail) in result.stderr.replace("\n", " ")
     assert result.stdout == ""
+
+
+def test_show_fetches_detail(mock_api) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == f"/api/tasks/{TID}"
+        return httpx.Response(200, json={"id": TID, "title": "shown", "revision": 2})
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["show", TID])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["revision"] == 2
+
+
+def test_edit_sends_only_provided_options_and_clears_description(mock_api) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PATCH"
+        assert request.url.path == f"/api/tasks/{TID}"
+        assert json.loads(request.content) == {"title": "renamed", "description": None}
+        return httpx.Response(200, json={"id": TID})
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["edit", TID, "--title", "renamed", "--description", ""])
+    assert result.exit_code == 0, result.output
+
+
+def test_edit_conflict_exits_nonzero(mock_api) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "detail": "Stale revision: task is at revision 5",
+                "current_task": {"id": TID, "revision": 5},
+            },
+        )
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["edit", TID, "--title", "renamed"])
+    assert result.exit_code == 1
+    assert "Stale revision" in result.stderr
 
 
 def test_unreachable_and_invalid_responses(mock_api) -> None:

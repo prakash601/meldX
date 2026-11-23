@@ -105,8 +105,50 @@ def list_tasks(
 
 @app.command()
 def done(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
-    """Complete a task and clear its lease."""
+    """Complete a task (idempotent) and clear its lease."""
     task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/complete"))
+    console.print_json(data=task)
+
+
+@app.command()
+def start(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
+    """Mark a task as personally doing — no agent identity, no lease."""
+    task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/start"))
+    console.print_json(data=task)
+
+
+@app.command()
+def reopen(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
+    """Reopen a completed task; completion history is preserved."""
+    task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/reopen"))
+    console.print_json(data=task)
+
+
+@app.command()
+def show(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
+    """Fetch one task with its revision and lifecycle fields."""
+    task = asyncio.run(_request("GET", f"/api/tasks/{task_id}"))
+    console.print_json(data=task)
+
+
+@app.command()
+def edit(
+    task_id: Annotated[UUID, typer.Argument(help="Task UUID.")],
+    title: Annotated[str | None, typer.Option(help="New title.")] = None,
+    description: Annotated[
+        str | None, typer.Option(help="New description; an empty string clears it.")
+    ] = None,
+    priority: Annotated[Priority | None, typer.Option(help="low, med, or high.")] = None,
+) -> None:
+    """Edit a task. Only provided options are sent; conflict exits nonzero."""
+    payload: dict[str, Any] = {}
+    if title is not None:
+        payload["title"] = title
+    if description is not None:
+        payload["description"] = description or None  # empty string clears
+    if priority is not None:
+        payload["priority"] = priority.value
+    task = asyncio.run(_request("PATCH", f"/api/tasks/{task_id}", payload=payload))
     console.print_json(data=task)
 
 

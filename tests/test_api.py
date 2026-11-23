@@ -125,6 +125,96 @@ async def test_update_handoff_snooze(client: AsyncClient) -> None:
     assert snoozed.json()["agent_id"] is None
 
 
+async def test_detail_start_reopen_flow(client: AsyncClient) -> None:
+    created = (await client.post("/api/tasks", json={"title": "focus work"})).json()
+    tid = created["id"]
+    detail = await client.get(f"/api/tasks/{tid}")
+    assert detail.status_code == 200
+    assert detail.json()["revision"] == 1
+    assert detail.json()["lifecycle"] == "open"
+    assert detail.json()["progress"] == "ready"
+    missing = await client.get("/api/tasks/00000000-0000-0000-0000-000000000000")
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "Task locked or not found"}
+
+    started = await client.post(f"/api/tasks/{tid}/start")
+    assert started.json()["progress"] == "doing"
+    assert started.json()["status"] == "doing"
+    again = await client.post(f"/api/tasks/{tid}/start")
+    assert again.json()["revision"] == started.json()["revision"]  # idempotent
+
+    done = await client.post(f"/api/tasks/{tid}/complete")
+    assert done.json()["lifecycle"] == "done"
+    refused = await client.post(f"/api/tasks/{tid}/start")
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "Task is done; reopen it first"
+    reopened = await client.post(f"/api/tasks/{tid}/reopen")
+    assert reopened.json()["lifecycle"] == "open"
+    assert reopened.json()["completed_at"] is None
+    assert reopened.json()["revision"] > done.json()["revision"]
+
+
+async def test_patch_revision_and_null_semantics(client: AsyncClient) -> None:
+    created = await client.post("/api/tasks", json={"title": "doc", "description": "v1"})
+    tid = created.json()["id"]
+    cleared = await client.patch(f"/api/tasks/{tid}", json={"description": None})
+    assert cleared.json()["description"] is None
+    patched = await client.patch(f"/api/tasks/{tid}", json={"title": "doc v2"})
+    assert patched.json()["description"] is None  # omitted keeps the cleared value
+    assert patched.json()["revision"] == 3  # create=1, clear=2, rename=3
+
+    assert (await client.patch(f"/api/tasks/{tid}", json={"title": None})).status_code == 422
+    assert (await client.patch(f"/api/tasks/{tid}", json={"priority": None})).status_code == 422
+
+    stale = await client.patch(
+        f"/api/tasks/{tid}", json={"title": "stale edit", "expected_revision": 1}
+    )
+    assert stale.status_code == 409
+    body = stale.json()
+    assert body["detail"] == "Stale revision: task is at revision 3"
+    assert body["current_task"]["title"] == "doc v2"
+    # reapply with the fresh revision succeeds
+    ok = await client.patch(
+        f"/api/tasks/{tid}", json={"title": "stale edit", "expected_revision": 3}
+    )
+    assert ok.json()["title"] == "stale edit"
+
+
+async def test_idempotency_key_replay_and_conflict(client: AsyncClient) -> None:
+    headers = {"Idempotency-Key": "cli-retry-1"}
+    first = await client.post("/api/tasks", json={"title": "retry me"}, headers=headers)
+    assert first.status_code == 201
+    replay = await client.post("/api/tasks", json={"title": "retry me"}, headers=headers)
+    assert replay.status_code == 201
+    assert replay.json()["id"] == first.json()["id"]
+    conflict = await client.post("/api/tasks", json={"title": "different"}, headers=headers)
+    assert conflict.status_code == 409
+    assert "already used with a different payload" in conflict.json()["detail"]
+    listing = (await client.get("/api/tasks")).json()
+    assert [t["title"] for t in listing] == ["retry me"]
+
+
+async def test_list_is_bounded(client: AsyncClient) -> None:
+    for i in range(3):
+        await client.post("/api/tasks", json={"title": f"page {i}"})
+    page = (await client.get("/api/tasks?limit=2&offset=1")).json()
+    assert [t["title"] for t in page] == ["page 1", "page 2"]
+    assert (await client.get("/api/tasks?limit=0")).status_code == 422
+    assert (await client.get("/api/tasks?limit=201")).status_code == 422
+
+
+async def test_title_is_trimmed_and_whitespace_only_fails(client: AsyncClient) -> None:
+    blank = await client.post("/api/tasks", json={"title": "   "})
+    assert blank.status_code == 400
+    assert blank.json()["detail"] == "Title cannot be empty"
+    trimmed = await client.post("/api/tasks", json={"title": "  padded  "})
+    assert trimmed.json()["title"] == "padded"
+    tid = trimmed.json()["id"]
+    blank_edit = await client.patch(f"/api/tasks/{tid}", json={"title": "   "})
+    assert blank_edit.status_code == 400
+    assert blank_edit.json()["detail"] == "Title cannot be empty"
+
+
 async def test_today_groups_actions_and_escaping(client: AsyncClient) -> None:
     first = (await client.post("/api/tasks", json={"title": "<script>alert(1)</script>"})).json()
     delegated = (
@@ -145,20 +235,73 @@ async def test_today_groups_actions_and_escaping(client: AsyncClient) -> None:
     page = await client.get("/")
     assert page.status_code == 200
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page.text
-    assert "finished task" not in page.text and "later task" not in page.text
+    assert "later task" not in page.text  # snoozed stays hidden
     assert 'data-group="inbox"' in page.text and 'data-group="today"' in page.text
     assert 'data-group="doing"' in page.text
-    assert "hermes-1" in page.text and "Details" in page.text
+    assert "hermes-1" in page.text and "Details</p>" in page.text
+    assert ">Start<" in page.text  # personal start on ready cards
     assert 'sse-connect="/api/events"' in page.text
     assert "sse:task.updated" in page.text
+    # F05: recent completions are visible with Undo
+    assert 'data-group="done"' in page.text
+    assert "finished task" in page.text and ">Undo<" in page.text
     claimed = await client.post(f"/tasks/{first['id']}/claim", data={"agent_id": "codex-1"})
     assert claimed.status_code == 200
     assert "data-lease=" in claimed.text
     conflict = await client.post(f"/tasks/{first['id']}/claim", data={"agent_id": "hermes-1"})
     assert conflict.status_code == 409
     done = await client.post(f"/tasks/{delegated['id']}/complete")
-    assert "delegated" not in done.text
+    assert "delegated" in done.text and 'data-group="done"' in done.text
     added = await client.post("/tasks", data={"title": "from web"})
     assert added.status_code == 200 and "from web" in added.text
     fragment = await client.get("/partials/tasks")
     assert fragment.status_code == 200 and "<html" not in fragment.text
+
+
+async def test_web_start_and_undo(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "personal"})).json()["id"]
+    started = await client.post(f"/tasks/{tid}/start")
+    assert started.status_code == 200
+    assert 'data-group="doing"' in started.text and "personal" in started.text
+    done = await client.post(f"/tasks/{tid}/complete")
+    assert ">Undo<" in done.text
+    undone = await client.post(f"/tasks/{tid}/reopen")
+    assert 'data-group="inbox"' in undone.text and "personal" in undone.text
+
+
+async def test_web_detail_edit_and_stale_conflict(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "web edit", "description": "first"})).json()["id"]
+    page = await client.get(f"/tasks/{tid}")
+    assert page.status_code == 200
+    assert f'hx-post="/tasks/{tid}/edit"' in page.text
+    assert 'name="expected_revision" value="1"' in page.text
+    assert "Task not found" not in page.text
+
+    saved = await client.post(
+        f"/tasks/{tid}/edit",
+        data={"title": "web edit v2", "description": "second", "priority": "high", "expected_revision": 1},
+    )
+    assert "web edit v2" in saved.text and "second" in saved.text
+
+    # Stale revision: the draft is preserved with a conflict banner and the
+    # fresh revision offered for reapply (F03).
+    stale = await client.post(
+        f"/tasks/{tid}/edit",
+        data={"title": "draft title", "description": "draft", "priority": "low", "expected_revision": 1},
+    )
+    assert "changed elsewhere" in stale.text
+    assert "draft title" in stale.text
+    assert 'name="expected_revision" value="2"' in stale.text
+
+    # Saving with the fresh revision succeeds.
+    ok = await client.post(
+        f"/tasks/{tid}/edit",
+        data={"title": "draft title", "description": "draft", "priority": "low", "expected_revision": 2},
+    )
+    assert "draft title" in ok.text and "changed elsewhere" not in ok.text
+
+    missing = await client.get("/tasks/00000000-0000-0000-0000-000000000000")
+    assert missing.status_code == 404
+    assert "Task not found" in missing.text
+    bad = await client.get("/tasks/not-a-uuid")
+    assert bad.status_code == 404 and "Task not found" in bad.text
