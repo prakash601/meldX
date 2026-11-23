@@ -14,12 +14,17 @@ router = APIRouter(prefix="/agents", tags=["agents"])
 Session = Annotated[AsyncSession, Depends(get_session)]
 
 
-@router.get("")
+@router.get("", summary="List agents", description="Every registered agent, ordered by id.")
 async def list_agents(session: Session) -> list[Agent]:
     return list((await session.exec(select(Agent).order_by(col(Agent.id)))).all())
 
 
-@router.post("")
+@router.post(
+    "",
+    summary="Upsert an agent",
+    description="Creates the agent when `id` is new, otherwise updates `type` and "
+    "`status`. Always refreshes `last_seen`. Idempotent, so it returns 200 for both.",
+)
 async def upsert_agent(payload: AgentUpsert, session: Session) -> Agent:
     agent = await session.get(Agent, payload.id)
     if agent is None:

@@ -9,6 +9,12 @@ alembic/__pycache__/
 .ruff_cache/
 .mypy_cache/
 .DS_Store
+.codegraph/
+
+# local SQLite dev database (see README: run locally without Postgres)
+*.db
+*.db-wal
+*.db-shm
 render.yaml.local
 
 # local agent scratch (never commit)

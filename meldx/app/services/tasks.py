@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import dateparser
+from sqlalchemy import or_, update
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -138,24 +139,40 @@ async def list_tasks(
 
 
 async def claim_task(session: AsyncSession, *, task_id: str, agent_id: str) -> Task:
-    """Exclusive claim. FOR UPDATE SKIP LOCKED wins races on PG (no-op on sqlite).
+    """Exclusive claim, using whichever primitive the backend actually enforces.
 
-    Agent row is ensured BEFORE the locked read: ensure_agent commits, and any
-    commit between SELECT FOR UPDATE and the final commit would release the
-    row lock early and reopen the race.
+    Agent row is ensured BEFORE the claim: ensure_agent commits, and any commit
+    between SELECT FOR UPDATE and the final commit would release the row lock
+    early and reopen the race.
     """
     tid = _coerce_id(task_id)
     await ensure_agent(session, agent_id)
+    now = _now()
+    if _dialect_name(session) == "sqlite":
+        task = await _claim_atomic(session, tid, agent_id, now)
+    else:
+        task = await _claim_skip_locked(session, tid, agent_id, now)
+    bus.publish("task.claimed", task)
+    return task
+
+
+def _dialect_name(session: AsyncSession) -> str:
+    return session.get_bind().dialect.name
+
+
+async def _claim_skip_locked(
+    session: AsyncSession, tid: UUID, agent_id: str, now: datetime
+) -> Task:
+    """Postgres path: the row lock makes the read-then-write claim atomic, and
+    SKIP LOCKED turns a contended row into an immediate failure instead of a
+    wait."""
     stmt = select(Task).where(col(Task.id) == tid).with_for_update(skip_locked=True)
     task = (await session.exec(stmt)).first()
     if task is None:
         if await session.get(Task, tid) is None:
             raise TaskNotFound(LOCKED_MSG)
         raise TaskLocked(LOCKED_MSG)
-    now = _now()
-    lease = _aware(task.lease_expires_at)
-    if lease is not None and lease > now and task.agent_id != agent_id:
-        raise ValueError(f"Task leased to {task.agent_id} until {lease.isoformat()}")
+    _guard_lease(task, agent_id, now)
     task.status = TaskStatus.doing
     task.agent_id = agent_id
     task.lease_expires_at = now + timedelta(minutes=lease_minutes())
@@ -163,8 +180,57 @@ async def claim_task(session: AsyncSession, *, task_id: str, agent_id: str) -> T
     session.add(task)
     await session.commit()
     await session.refresh(task)
-    bus.publish("task.claimed", task)
     return task
+
+
+async def _claim_atomic(
+    session: AsyncSession, tid: UUID, agent_id: str, now: datetime
+) -> Task:
+    """SQLite path.
+
+    SQLite silently ignores SELECT ... FOR UPDATE, so the read-then-write claim
+    above lets two claimants both pass the lease check and both win. A single
+    conditional UPDATE is atomic there: SQLite serialises writers, so the loser
+    re-evaluates the WHERE clause against the committed row and matches nothing.
+    """
+    stmt = (
+        update(Task)
+        .where(col(Task.id) == tid)
+        .where(
+            or_(
+                col(Task.lease_expires_at).is_(None),
+                col(Task.lease_expires_at) <= now,
+                col(Task.agent_id) == agent_id,
+            )
+        )
+        .values(
+            status=TaskStatus.doing,
+            agent_id=agent_id,
+            lease_expires_at=now + timedelta(minutes=lease_minutes()),
+            updated_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    result = await session.exec(stmt)
+    if result.rowcount != 1:
+        task = await session.get(Task, tid)
+        if task is None:
+            raise TaskNotFound(LOCKED_MSG)
+        _guard_lease(task, agent_id, now)
+        raise TaskLocked(LOCKED_MSG)
+    await session.commit()
+    session.expire_all()  # expire_on_commit is False, so reload explicitly
+    claimed = await session.get(Task, tid)
+    if claimed is None:  # pragma: no cover - row existed a statement ago
+        raise TaskNotFound(LOCKED_MSG)
+    return claimed
+
+
+def _guard_lease(task: Task, agent_id: str, now: datetime) -> None:
+    """Reject a claim when another agent holds an unexpired lease."""
+    lease = _aware(task.lease_expires_at)
+    if lease is not None and lease > now and task.agent_id != agent_id:
+        raise ValueError(f"Task leased to {task.agent_id} until {lease.isoformat()}")
 
 
 async def complete_task(session: AsyncSession, *, task_id: str) -> Task:

@@ -14,7 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from meldx.app import bus
 from meldx.app.api import agents, events, tasks
-from meldx.app.db import check_db, get_engine
+from meldx.app.db import check_db, ensure_schema, get_engine, is_sqlite
 from meldx.app.mcp.tools import mcp as mcp_server
 from meldx.app.services import tasks as svc
 from meldx.app.web import router as web
@@ -30,6 +30,35 @@ class JSONFormatter(logging.Formatter):
                 "status": getattr(record, "status", None),
             }
         )
+
+
+DESCRIPTION = """
+One shared todo queue that humans and agents can claim and complete without colliding.
+
+One process serves four interfaces over the same task services: MCP at `/mcp`
+(Streamable HTTP, seven `todo_*` tools for ChatGPT, Codex, OpenCode, Hermes), REST
+at `/api` (tasks, agents, SSE), the Jinja2 + HTMX Today board at `/`, and a
+readiness probe at `/health` that runs `SELECT 1`.
+
+Lease semantics: `POST /api/tasks/{task_id}/claim` takes an exclusive lease
+(`LEASE_MINUTES`, default 30) inside a `FOR UPDATE SKIP LOCKED` transaction. A task
+with an unexpired lease held by another agent cannot be claimed; once the lease
+expires the task becomes claimable again. `complete` clears the owner and lease.
+
+Task errors mirror the MCP tool messages verbatim so clients can switch transports
+without changing their handling: `404` for an unknown task id (`Task locked or not
+found`), `409` when a row is locked by an in-flight claim (`Task locked or not
+found`) or leased to another agent (`Task leased to {agent} until {ts}`), and `400`
+for an unparseable due/snooze string.
+""".strip()
+
+OPENAPI_TAGS = [
+    {"name": "tasks", "description": "Create, list, claim, complete, update, hand off, snooze."},
+    {"name": "agents", "description": "Minimal agent registry: who can hold a lease."},
+    {"name": "events", "description": "Server-Sent Events for committed task mutations."},
+    {"name": "health", "description": "Readiness probe backed by a database round-trip."},
+    {"name": "web", "description": "HTML/HTMX fragments serving the Today board."},
+]
 
 
 def configure_logging() -> None:
@@ -58,7 +87,18 @@ def mcp_transport_security() -> TransportSecuritySettings:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging()
+    logger = logging.getLogger("meldx")
     get_engine()  # fail fast on bad DATABASE_URL
+    if is_sqlite():
+        # No server to start: create the schema the Alembic Postgres migration
+        # cannot create here, and say plainly which guarantee is not covered.
+        await ensure_schema()
+        logger.warning(
+            "local SQLite database: claims use an atomic conditional UPDATE. "
+            "The Postgres FOR UPDATE SKIP LOCKED race path is not exercised here; "
+            "run the race suite against Postgres before trusting lease behaviour.",
+            extra={"event": "db.sqlite_dev", "status": "dev"},
+        )
     bus.init_bus()  # fresh event queue per boot
     # Mounted sub-apps don't get their lifespan run — nest it manually so the
     # streamable-HTTP task group starts.
@@ -68,11 +108,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     mcp_app = mcp_server.streamable_http_app(transport_security=mcp_transport_security())
-    app = FastAPI(title="meldX")
+    app = FastAPI(
+        title="meldX",
+        version="0.0.1",
+        description=DESCRIPTION,
+        openapi_tags=OPENAPI_TAGS,
+    )
     app.state.mcp_app = mcp_app
     app.router.lifespan_context = lifespan
 
-    @app.get("/health")
+    @app.get(
+        "/health",
+        tags=["health"],
+        summary="Readiness probe",
+        description="Runs `SELECT 1` against Postgres. Returns 503 when the DB is unreachable.",
+        responses={503: {"description": "Database unreachable."}},
+    )
     async def health() -> dict[str, bool]:
         try:
             await check_db()
