@@ -184,6 +184,20 @@ def unsnooze(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> Non
 
 
 @app.command()
+def archive(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
+    """Hide a task from ordinary views; read-only until restored."""
+    task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/archive"))
+    console.print_json(data=task)
+
+
+@app.command()
+def restore(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
+    """Return an archived task to ordinary views, dates untouched."""
+    task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/restore"))
+    console.print_json(data=task)
+
+
+@app.command()
 def done(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
     """Complete a task (idempotent) and clear its lease."""
     task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/complete"))

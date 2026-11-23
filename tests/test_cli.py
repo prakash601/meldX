@@ -136,6 +136,8 @@ def test_completed_uses_view_and_window(mock_api) -> None:
         (["unplan", TID], {"date": None}, f"/api/tasks/{TID}/plan"),
         (["snooze", TID, "tomorrow 9am"], {"until": "tomorrow 9am"}, f"/api/tasks/{TID}/snooze"),
         (["unsnooze", TID], None, f"/api/tasks/{TID}/unsnooze"),
+        (["archive", TID], None, f"/api/tasks/{TID}/archive"),
+        (["restore", TID], None, f"/api/tasks/{TID}/restore"),
     ],
 )
 def test_mutation_commands(mock_api, command, payload, path) -> None:

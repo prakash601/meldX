@@ -27,7 +27,7 @@ execution_router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 Session = Annotated[AsyncSession, Depends(get_session)]
 
-NAV_VIEWS = ("today", "inbox", "upcoming", "open", "completed")
+NAV_VIEWS = ("today", "inbox", "upcoming", "open", "completed", "archive")
 
 
 def _aware_utc(dt: datetime | None) -> datetime | None:
@@ -78,6 +78,9 @@ async def board(
         )
         label = "Completed today" if completed_days == 1 else f"Completed (last {completed_days} days)"
         sections = [(label, completed, "completed")]
+    elif view == "archive":
+        archived = await svc.view_tasks(session, view="archive")
+        sections = [("Archive", archived, "archive")]
     else:
         labels = {"inbox": "Inbox", "upcoming": "Upcoming", "open": "All open"}
         sections = [(labels[view], await svc.view_tasks(session, view=view), view)]
@@ -160,6 +163,17 @@ async def completed(
     return await board(
         request, session, "board.html", view="completed", completed_days=days
     )
+
+
+@router.get(
+    "/archive",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Archive board",
+    description="Archived tasks with Restore. Nothing is deleted; metadata is preserved.",
+)
+async def archive(request: Request, session: Session) -> HTMLResponse:
+    return await board(request, session, "board.html", view="archive")
 
 
 @router.get(
@@ -381,6 +395,34 @@ async def claim_task(
 ) -> HTMLResponse:
     request.state.agent_id = agent_id
     await svc.claim_task(session, task_id=task_id, agent_id=agent_id)
+    return await board(request, session, "partials/board.html", view=view)
+
+
+@router.post(
+    "/tasks/{task_id}/archive",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Archive task (form)",
+    description="Hides the task from ordinary views; read-only until restored.",
+)
+async def archive_task(
+    request: Request, task_id: str, session: Session, view: Annotated[str, Form()] = "today"
+) -> HTMLResponse:
+    await svc.archive_task(session, task_id=task_id)
+    return await board(request, session, "partials/board.html", view=view)
+
+
+@router.post(
+    "/tasks/{task_id}/restore",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Restore task (form)",
+    description="Returns an archived task to ordinary views, dates untouched.",
+)
+async def restore_task(
+    request: Request, task_id: str, session: Session, view: Annotated[str, Form()] = "today"
+) -> HTMLResponse:
+    await svc.restore_task(session, task_id=task_id)
     return await board(request, session, "partials/board.html", view=view)
 
 

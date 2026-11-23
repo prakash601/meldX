@@ -167,6 +167,12 @@ def _guard_not_done(task: Task) -> None:
         raise TaskStateConflict("Task is done; reopen it first")
 
 
+def _guard_not_archived(task: Task) -> None:
+    """Archived rows are read-only until restored (plan §4.3, F09.2)."""
+    if task.archived_at is not None:
+        raise TaskStateConflict("Task is archived; restore it first")
+
+
 def _request_hash(**fields: Any) -> str:
     blob = json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(blob.encode()).hexdigest()
@@ -355,6 +361,7 @@ async def _claim_skip_locked(
             raise TaskNotFound(LOCKED_MSG)
         raise TaskLocked(LOCKED_MSG)
     _guard_not_done(task)
+    _guard_not_archived(task)
     _guard_lease(task, agent_id, now)
     task.progress = TaskProgress.doing
     task.agent_id = agent_id
@@ -383,6 +390,7 @@ async def _claim_atomic(
     stmt = (
         update(Task)
         .where(col(Task.id) == tid)
+        .where(col(Task.archived_at).is_(None))
         .where(col(Task.lifecycle) != TaskLifecycle.done)
         .where(
             or_(
@@ -406,6 +414,7 @@ async def _claim_atomic(
         task = await session.get(Task, tid)
         if task is None:
             raise TaskNotFound(LOCKED_MSG)
+        _guard_not_archived(task)
         _guard_not_done(task)
         _guard_lease(task, agent_id, now)
         raise TaskLocked(LOCKED_MSG)
@@ -436,6 +445,7 @@ async def complete_task(session: AsyncSession, *, task_id: str) -> Task:
     """Idempotent completion: a repeated request keeps the original timestamp
     and records no duplicate activity or event."""
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     if task.lifecycle is TaskLifecycle.done:
         return task
     now = _now()
@@ -460,6 +470,7 @@ async def reopen_task(session: AsyncSession, *, task_id: str) -> Task:
     and planning markers are reintroduced as data in v0.0.2 (ADR-004).
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     if task.lifecycle is TaskLifecycle.open:
         return task
     task.lifecycle = TaskLifecycle.open
@@ -478,6 +489,7 @@ async def reopen_task(session: AsyncSession, *, task_id: str) -> Task:
 async def start_task(session: AsyncSession, *, task_id: str) -> Task:
     """Personal doing: no agent identity, no lease. Idempotent."""
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     _guard_not_done(task)
     if task.progress is TaskProgress.doing:
         return task
@@ -514,6 +526,7 @@ async def update_task(
     409 carrying the current task so the client can reload.
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     if expected_revision is not None and expected_revision != task.revision:
         raise StaleRevision(task)
     if title is not None:
@@ -559,6 +572,7 @@ async def handoff_task(
     session: AsyncSession, *, task_id: str, to_agent: str, note: str | None = None
 ) -> Task:
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     await ensure_agent(session, to_agent)
     task.agent_id = to_agent
     task.status = TaskStatus.today
@@ -588,6 +602,7 @@ async def snooze_task(session: AsyncSession, *, task_id: str, until: str) -> Tas
     the past is rejected.
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     instant = dates.parse_instant(until)
     if instant <= _now():
         raise ValueError(f"Cannot snooze into the past: {until!r}")
@@ -617,6 +632,7 @@ async def plan_task(session: AsyncSession, *, task_id: str, date: str | None) ->
     none) reads as `inbox`.
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     planned = parse_due_date(date)
     task.planned_date = planned
     if task.lifecycle is TaskLifecycle.open and task.progress is TaskProgress.ready:
@@ -640,6 +656,7 @@ async def unsnooze_task(session: AsyncSession, *, task_id: str) -> Task:
     `inbox`; the owner replans rather than the service guessing (plan §4.3).
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     if task.snoozed_until is None:
         return task
     task.snoozed_until = None
@@ -657,7 +674,59 @@ async def unsnooze_task(session: AsyncSession, *, task_id: str) -> Task:
     return task
 
 
-VIEW_NAMES = ("today", "inbox", "upcoming", "open", "overdue", "missed", "completed")
+async def archive_task(session: AsyncSession, *, task_id: str) -> Task:
+    """Reversible removal from ordinary views (plan §4.3, F09).
+
+    Lifecycle, scheduling, and completion metadata are all preserved; an
+    archived row is read-only until restored. Idempotent.
+    """
+    task = await _get_or_locked(session, _coerce_id(task_id))
+    if task.archived_at is not None:
+        return task
+    task.archived_at = _now()
+    _touch(task)
+    session.add(task)
+    session.add(_record(task.id, action="archived"))
+    await session.commit()
+    await session.refresh(task)
+    bus.publish("task.updated", task)
+    return task
+
+
+async def restore_task(session: AsyncSession, *, task_id: str) -> Task:
+    """Return an archived task to ordinary views, dates untouched (F09.3).
+
+    A restored overdue task shows as overdue; nothing is silently replanned.
+    Idempotent for tasks that were never archived.
+    """
+    task = await _get_or_locked(session, _coerce_id(task_id))
+    if task.archived_at is None:
+        return task
+    task.archived_at = None
+    _touch(task)
+    session.add(task)
+    session.add(_record(task.id, action="restored"))
+    await session.commit()
+    await session.refresh(task)
+    bus.publish("task.updated", task)
+    return task
+
+
+VIEW_NAMES = (
+    "today",
+    "inbox",
+    "upcoming",
+    "open",
+    "overdue",
+    "missed",
+    "completed",
+    "archive",
+)
+
+
+def _is_live(task: Task) -> bool:
+    """Ordinary views never show archived rows (plan §4.3)."""
+    return task.archived_at is None
 
 
 def _snoozed_active(task: Task, now: datetime) -> bool:
@@ -680,9 +749,9 @@ def _legacy_today_marker(task: Task) -> bool:
 
 
 def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> list[Task]:
-    """View membership per product plan §4.3. All views are open-lifecycle
-    unless stated. Snoozed tasks stay hidden until their instant passes —
-    expiry is derived at query time, no scheduler needed."""
+    """View membership per product plan §4.3. Ordinary views exclude archived
+    rows. Snoozed tasks stay hidden until their instant passes — expiry is
+    derived at query time, no scheduler needed."""
     now = _now()
     today = dates.today_date()
     _, day_end = dates.local_day_bounds(today)
@@ -695,7 +764,8 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
         return [
             t
             for t in tasks
-            if t.lifecycle is TaskLifecycle.open
+            if _is_live(t)
+            and t.lifecycle is TaskLifecycle.open
             and t.progress is TaskProgress.ready
             and not _snoozed_active(t, now)
             and not _legacy_today_marker(t)
@@ -707,7 +777,8 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
         return [
             t
             for t in tasks
-            if t.lifecycle is TaskLifecycle.open
+            if _is_live(t)
+            and t.lifecycle is TaskLifecycle.open
             and not _snoozed_active(t, now)
             and (_planned_today(t, today) or _due_today(t, today) or _legacy_today_marker(t))
         ]
@@ -716,13 +787,16 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
         return [
             t
             for t in tasks
-            if t.lifecycle is TaskLifecycle.open and dates.is_overdue(_aware(t.due_at), t.due_date)
+            if _is_live(t)
+            and t.lifecycle is TaskLifecycle.open
+            and dates.is_overdue(_aware(t.due_at), t.due_date)
         ]
     if view == "missed":
         return [
             t
             for t in tasks
-            if t.lifecycle is TaskLifecycle.open
+            if _is_live(t)
+            and t.lifecycle is TaskLifecycle.open
             and t.planned_date is not None
             and t.planned_date < today
         ]
@@ -730,7 +804,8 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
         return [
             t
             for t in tasks
-            if t.lifecycle is TaskLifecycle.open
+            if _is_live(t)
+            and t.lifecycle is TaskLifecycle.open
             and (
                 (t.planned_date is not None and t.planned_date > today)
                 or (t.due_date is not None and t.due_date > today)
@@ -738,7 +813,7 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
             )
         ]
     if view == "open":
-        return [t for t in tasks if t.lifecycle is TaskLifecycle.open]
+        return [t for t in tasks if _is_live(t) and t.lifecycle is TaskLifecycle.open]
     if view == "completed":
         start = dates.local_day_bounds(today - timedelta(days=max(completed_days, 1) - 1))[0]
 
@@ -746,7 +821,13 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
             completed = _aware(task.completed_at)
             return completed is not None and start <= completed
 
-        return [t for t in tasks if t.lifecycle is TaskLifecycle.done and completed_in_range(t)]
+        return [
+            t
+            for t in tasks
+            if _is_live(t) and t.lifecycle is TaskLifecycle.done and completed_in_range(t)
+        ]
+    if view == "archive":
+        return [t for t in tasks if t.archived_at is not None]
     raise ValueError(f"Unknown view: {view!r}")
 
 

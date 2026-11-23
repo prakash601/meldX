@@ -278,6 +278,35 @@ async def test_deadline_editing_and_mutual_exclusion(client: AsyncClient) -> Non
     assert dated.json()["due_date"] == "2026-12-24"
 
 
+async def test_archive_and_restore_via_rest(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "irrelevant now"})).json()["id"]
+    archived = await client.post(f"/api/tasks/{tid}/archive")
+    assert archived.status_code == 200 and archived.json()["archived_at"] is not None
+    # excluded from ordinary lists, present in the archive view
+    assert (await client.get("/api/tasks?view=inbox")).json() == []
+    assert [t["id"] for t in (await client.get("/api/tasks?view=archive")).json()] == [tid]
+    # read-only while archived
+    refused = await client.patch(f"/api/tasks/{tid}", json={"title": "nope"})
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "Task is archived; restore it first"
+    assert (await client.post(f"/api/tasks/{tid}/complete")).status_code == 409
+    restored = await client.post(f"/api/tasks/{tid}/restore")
+    assert restored.json()["archived_at"] is None
+    assert [t["id"] for t in (await client.get("/api/tasks?view=inbox")).json()] == [tid]
+
+
+async def test_web_archive_navigation_and_buttons(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "to archive"})).json()["id"]
+    archive_page = await client.get("/archive")
+    assert archive_page.status_code == 200 and ">Archive<" in archive_page.text
+    archived = await client.post(f"/tasks/{tid}/archive", data={"view": "inbox"})
+    assert "to archive" not in archived.text
+    archive_page = await client.get("/archive")
+    assert "to archive" in archive_page.text and ">Restore<" in archive_page.text
+    restored = await client.post(f"/tasks/{tid}/restore", data={"view": "inbox"})
+    assert "to archive" in restored.text and 'data-group="inbox"' in restored.text
+
+
 async def test_today_groups_actions_and_escaping(client: AsyncClient) -> None:
     first = (await client.post("/api/tasks", json={"title": "<script>alert(1)</script>"})).json()
     delegated = (

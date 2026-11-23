@@ -146,6 +146,31 @@ async def unsnooze_task(task_id: str, session: Session) -> Task:
 
 
 @router.post(
+    "/{task_id}/archive",
+    summary="Archive a task",
+    description="Removes the task from ordinary views without deleting anything; "
+    "lifecycle, scheduling, and completion metadata are preserved. Archived "
+    "rows are read-only until restored (409 `Task is archived; restore it "
+    "first`). Idempotent.",
+    responses=CLIENT_ERROR_RESPONSES,
+)
+async def archive_task(task_id: str, session: Session) -> Task:
+    return await svc.archive_task(session, task_id=task_id)
+
+
+@router.post(
+    "/{task_id}/restore",
+    summary="Restore an archived task",
+    description="Returns an archived task to ordinary views with its dates "
+    "untouched — a restored overdue task shows as overdue, nothing is "
+    "silently replanned. Idempotent for tasks that were never archived.",
+    responses=CLIENT_ERROR_RESPONSES,
+)
+async def restore_task(task_id: str, session: Session) -> Task:
+    return await svc.restore_task(session, task_id=task_id)
+
+
+@router.post(
     "/{task_id}/reopen",
     summary="Reopen a task",
     description="Returns a done task to open/ready and clears `completed_at`; the "

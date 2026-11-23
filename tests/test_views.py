@@ -13,7 +13,7 @@ from sqlmodel import SQLModel, col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from meldx.app import dates
-from meldx.app.models import Task
+from meldx.app.models import Task, TaskActivity
 from meldx.app.services import tasks as svc
 
 
@@ -182,3 +182,58 @@ async def test_summary_lists_are_separate_and_overlap_is_fine(maker) -> None:
         assert summary["overdue"] == []
         assert summary["missed_plans"] == []
         assert [t.id for t in summary["completed_today"]] == [finished.id]
+
+
+async def test_archive_hides_from_views_and_is_reversible(maker) -> None:
+    async with maker() as s:
+        task = await svc.create_task(s, title="old work", due_date="2026-11-01")
+        archived = await svc.archive_task(s, task_id=str(task.id))
+        assert archived.archived_at is not None
+        # excluded from every ordinary view, including overdue and summary
+        for view in ("inbox", "today", "upcoming", "open", "overdue"):
+            assert await svc.view_tasks(s, view=view) == []
+        summary = await svc.today_summary(s)
+        assert summary["overdue"] == []
+        # visible only in the archive view, metadata preserved
+        listed = await svc.view_tasks(s, view="archive")
+        assert [t.id for t in listed] == [task.id]
+        assert listed[0].due_date == task.due_date
+
+        # archived rows are read-only (F09.2)
+        with pytest.raises(svc.TaskStateConflict, match="restore it first"):
+            await svc.update_task(s, task_id=str(task.id), title="nope")
+        with pytest.raises(svc.TaskStateConflict, match="restore it first"):
+            await svc.plan_task(s, task_id=str(task.id), date="today")
+        with pytest.raises(svc.TaskStateConflict, match="restore it first"):
+            await svc.complete_task(s, task_id=str(task.id))
+        with pytest.raises(svc.TaskStateConflict, match="restore it first"):
+            await svc.claim_task(s, task_id=str(task.id), agent_id="codex-1")
+
+        # restore: dates untouched, an overdue task shows as overdue (F09.3)
+        restored = await svc.restore_task(s, task_id=str(task.id))
+        assert restored.archived_at is None and restored.due_date == task.due_date
+        assert [t.id for t in await svc.view_tasks(s, view="overdue")] == [task.id]
+        assert await svc.view_tasks(s, view="archive") == []
+
+
+async def test_archive_is_idempotent_and_records_history(maker) -> None:
+    async with maker() as s:
+        task = await svc.create_task(s, title="cycle")
+        first = await svc.archive_task(s, task_id=str(task.id))
+        second = await svc.archive_task(s, task_id=str(task.id))
+        assert second.revision == first.revision  # no-op, no bump
+        await svc.restore_task(s, task_id=str(task.id))
+        # history survives the archive/restore cycle (acceptance F09)
+        rows = (
+            await s.exec(
+                select(TaskActivity).where(col(TaskActivity.task_id) == task.id)
+            )
+        ).all()
+        assert [r.action for r in rows] == ["created", "archived", "restored"]
+
+
+async def test_restore_is_idempotent_for_live_tasks(maker) -> None:
+    async with maker() as s:
+        task = await svc.create_task(s, title="never archived")
+        restored = await svc.restore_task(s, task_id=str(task.id))
+        assert restored.archived_at is None and restored.revision == 1

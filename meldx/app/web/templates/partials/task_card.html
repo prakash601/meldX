@@ -19,11 +19,17 @@
     <button hx-post="/tasks/{{ task.id }}/reopen" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Undo</button>
     <a href="/tasks/{{ task.id }}" class="text-xs text-slate-400 underline">Details</a>
   </div>
+  {% elif task.archived_at %}
+  <div class="flex flex-wrap gap-2 mt-4 items-center">
+    <button hx-post="/tasks/{{ task.id }}/restore" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg bg-teal-950 text-teal-300 px-3 py-2">Restore</button>
+    <a href="/tasks/{{ task.id }}" class="text-xs text-slate-400 underline">Details</a>
+  </div>
   {% else %}
   <div class="flex flex-wrap gap-2 mt-4 items-center">
     {% if task.progress.value == 'ready' %}<button hx-post="/tasks/{{ task.id }}/start" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Start</button>{% endif %}
     {% if agent_execution %}<button hx-post="/tasks/{{ task.id }}/claim" hx-include="#agent-id, #current-view" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Claim</button>{% endif %}
     <button hx-post="/tasks/{{ task.id }}/complete" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg bg-teal-950 text-teal-300 px-3 py-2">Complete</button>
+    <button hx-post="/tasks/{{ task.id }}/archive" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-800 text-slate-500 px-3 py-2">Archive</button>
     <a href="/tasks/{{ task.id }}" class="text-xs text-slate-400 underline">Details</a>
   </div>
   <div class="flex flex-wrap gap-2 mt-3 items-center text-xs">
