@@ -9,7 +9,7 @@ from fastapi.templating import Jinja2Templates
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from meldx.app.db import get_session
-from meldx.app.models import TaskStatus
+from meldx.app.models import Priority, TaskStatus
 from meldx.app.services import tasks as svc
 
 router = APIRouter()
@@ -28,6 +28,9 @@ async def board(request: Request, session: AsyncSession, template: str) -> HTMLR
         status.value: [t for t in tasks if t.status == status]
         for status in (TaskStatus.inbox, TaskStatus.today, TaskStatus.doing)
     }
+    done = [t for t in tasks if t.status == TaskStatus.done]
+    done.sort(key=lambda t: t.completed_at or t.updated_at, reverse=True)
+    groups[TaskStatus.done.value] = done[:10]  # recent completions with Undo
     return templates.TemplateResponse(
         request=request,
         name=template,
@@ -91,6 +94,107 @@ async def claim_task(
     request.state.agent_id = agent_id
     await svc.claim_task(session, task_id=task_id, agent_id=agent_id)
     return await board(request, session, "partials/task_groups.html")
+
+
+@router.post(
+    "/tasks/{task_id}/start",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Start task (form)",
+    description="Personal doing with no agent identity or lease. Returns the refreshed board.",
+)
+async def start_task(request: Request, task_id: str, session: Session) -> HTMLResponse:
+    await svc.start_task(session, task_id=task_id)
+    return await board(request, session, "partials/task_groups.html")
+
+
+@router.post(
+    "/tasks/{task_id}/reopen",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Undo completion (form)",
+    description="Reopens a done task to open/ready; history is preserved. Returns the board.",
+)
+async def reopen_task(request: Request, task_id: str, session: Session) -> HTMLResponse:
+    await svc.reopen_task(session, task_id=task_id)
+    return await board(request, session, "partials/task_groups.html")
+
+
+@router.get(
+    "/tasks/{task_id}",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Task detail page",
+    description="One task with an edit form (revision-guarded) and lifecycle metadata.",
+)
+async def task_detail(request: Request, task_id: str, session: Session) -> HTMLResponse:
+    try:
+        task = await svc.get_task(session, task_id=task_id)
+    except ValueError:
+        return templates.TemplateResponse(
+            request=request, name="missing.html", status_code=404, context={}
+        )
+    return templates.TemplateResponse(
+        request=request,
+        name="detail.html",
+        context={
+            "task": task,
+            "agent_execution": getattr(request.app.state, "agent_execution", False),
+        },
+    )
+
+
+@router.post(
+    "/tasks/{task_id}/edit",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Edit task (form)",
+    description="Revision-guarded edit. A stale revision re-renders the form with the "
+    "draft preserved and a conflict banner offering reload or reapply.",
+)
+async def edit_task(
+    request: Request,
+    task_id: str,
+    session: Session,
+    title: Annotated[str, Form(min_length=1, max_length=300)],
+    description: Annotated[str | None, Form()] = None,
+    priority: Annotated[Priority, Form()] = Priority.med,
+    expected_revision: Annotated[int, Form(ge=1)] = 1,
+) -> HTMLResponse:
+    # Form encoding has no explicit-null: an empty description field clears it.
+    try:
+        task = await svc.update_task(
+            session,
+            task_id=task_id,
+            title=title,
+            description=description if description else None,
+            priority=priority.value,
+            description_provided=True,
+            expected_revision=expected_revision,
+        )
+    except svc.StaleRevision as conflict:
+        return templates.TemplateResponse(
+            request=request,
+            name="partials/task_detail.html",
+            context={
+                "task": conflict.task,
+                "draft": {
+                    "title": title,
+                    "description": description,
+                    "priority": priority.value,
+                },
+                "conflict": True,
+                "agent_execution": getattr(request.app.state, "agent_execution", False),
+            },
+        )
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/task_detail.html",
+        context={
+            "task": task,
+            "agent_execution": getattr(request.app.state, "agent_execution", False),
+        },
+    )
 
 
 @router.post(

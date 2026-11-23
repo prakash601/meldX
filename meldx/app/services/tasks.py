@@ -214,6 +214,9 @@ async def create_task(
     """Create with optional idempotency (ADR-004): same client/key/payload
     replays the stored snapshot; same key with a different payload is a 409.
     Key and task commit atomically."""
+    title = title.strip()
+    if not title:
+        raise ValueError("Title cannot be empty")
     request_hash: str | None = None
     if idempotency_key is not None:
         request_hash = _request_hash(
@@ -496,6 +499,10 @@ async def update_task(
     task = await _get_or_locked(session, _coerce_id(task_id))
     if expected_revision is not None and expected_revision != task.revision:
         raise StaleRevision(task)
+    if title is not None:
+        title = title.strip()
+        if not title:
+            raise ValueError("Title cannot be empty")
     changed: list[str] = []
     if title is not None and title != task.title:
         task.title = title

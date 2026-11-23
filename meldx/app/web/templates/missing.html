@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="max-w-2xl rounded-xl border border-slate-800 bg-slate-900 p-6">
+  <h2 class="text-xl font-medium">Task not found</h2>
+  <p class="text-slate-400 mt-3 text-sm">
+    No task exists with that id — the link may be stale or mistyped. Nothing was changed.
+  </p>
+  <a href="/" class="inline-block mt-4 text-teal-400 text-sm">← Back to Today</a>
+</div>
+{% endblock %}
