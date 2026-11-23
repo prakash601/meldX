@@ -295,41 +295,83 @@ async def test_today_groups_actions_and_escaping(client: AsyncClient) -> None:
     snoozed = (await client.post("/api/tasks", json={"title": "later task"})).json()
     await client.post(f"/api/tasks/{completed['id']}/complete")
     await client.post(f"/api/tasks/{snoozed['id']}/snooze", json={"until": "tomorrow"})
+
+    # Today page: the delegated task's legacy marker keeps it visible; the
+    # plain inbox task and the snoozed/completed tasks are NOT on Today.
     page = await client.get("/")
     assert page.status_code == 200
-    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page.text
-    assert "later task" not in page.text  # snoozed stays hidden
-    assert 'data-group="inbox"' in page.text and 'data-group="today"' in page.text
-    assert 'data-group="doing"' in page.text
-    assert "hermes-1" in page.text and "Details</p>" in page.text
-    assert ">Start<" in page.text  # personal start on ready cards
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" not in page.text
+    assert "delegated" in page.text and "Details</p>" in page.text
+    assert "later task" not in page.text and "finished task" not in page.text
+    assert 'data-group="today"' in page.text
+    assert ">Start<" in page.text  # the delegated card is open+ready
+    assert 'hx-get="/partials/tasks?view=today"' in page.text
     assert 'sse-connect="/api/events"' in page.text
     assert "sse:task.updated" in page.text
-    # F05: recent completions are visible with Undo
-    assert 'data-group="done"' in page.text
-    assert "finished task" in page.text and ">Undo<" in page.text
-    claimed = await client.post(f"/tasks/{first['id']}/claim", data={"agent_id": "codex-1"})
+
+    # Inbox page: the capture queue, escaped rendering.
+    inbox = await client.get("/inbox")
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in inbox.text
+    assert 'data-group="inbox"' in inbox.text
+    assert ">Start<" in inbox.text
+    assert ">Plan today<" in inbox.text and "Unsnooze" not in inbox.text
+
+    # All open keeps actively snoozed work discoverable with a badge.
+    everything = await client.get("/open")
+    assert "later task" in everything.text and "😴 snoozed until" in everything.text
+
+    # Completed page: completion-time membership with Undo (F05).
+    done_page = await client.get("/completed")
+    assert "finished task" in done_page.text and ">Undo<" in done_page.text
+
+    claimed = await client.post(f"/tasks/{first['id']}/claim", data={"agent_id": "codex-1", "view": "today"})
     assert claimed.status_code == 200
     assert "data-lease=" in claimed.text
-    conflict = await client.post(f"/tasks/{first['id']}/claim", data={"agent_id": "hermes-1"})
+    conflict = await client.post(f"/tasks/{first['id']}/claim", data={"agent_id": "hermes-1", "view": "today"})
     assert conflict.status_code == 409
-    done = await client.post(f"/tasks/{delegated['id']}/complete")
-    assert "delegated" in done.text and 'data-group="done"' in done.text
-    added = await client.post("/tasks", data={"title": "from web"})
+    # The claimed task is doing: Today shows it under In progress.
+    assert "alert(1)" in claimed.text and 'data-group="in-progress"' in claimed.text
+    done = await client.post(f"/tasks/{delegated['id']}/complete", data={"view": "today"})
+    assert "delegated" not in done.text
+    added = await client.post("/tasks", data={"title": "from web", "view": "inbox"})
     assert added.status_code == 200 and "from web" in added.text
-    fragment = await client.get("/partials/tasks")
+    fragment = await client.get("/partials/tasks?view=inbox")
     assert fragment.status_code == 200 and "<html" not in fragment.text
 
 
 async def test_web_start_and_undo(client: AsyncClient) -> None:
     tid = (await client.post("/api/tasks", json={"title": "personal"})).json()["id"]
-    started = await client.post(f"/tasks/{tid}/start")
+    started = await client.post(f"/tasks/{tid}/start", data={"view": "today"})
     assert started.status_code == 200
-    assert 'data-group="doing"' in started.text and "personal" in started.text
-    done = await client.post(f"/tasks/{tid}/complete")
-    assert ">Undo<" in done.text
-    undone = await client.post(f"/tasks/{tid}/reopen")
+    assert 'data-group="in-progress"' in started.text and "personal" in started.text
+    done = await client.post(f"/tasks/{tid}/complete", data={"view": "today"})
+    assert "personal" not in done.text  # left Today; completed view holds it
+    completed_page = await client.get("/completed")
+    assert "personal" in completed_page.text and ">Undo<" in completed_page.text
+    undone = await client.post(f"/tasks/{tid}/reopen", data={"view": "inbox"})
     assert 'data-group="inbox"' in undone.text and "personal" in undone.text
+
+
+async def test_web_plan_snooze_controls(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "schedule me"})).json()["id"]
+    planned = await client.post(f"/tasks/{tid}/plan", data={"date": "today", "view": "today"})
+    assert planned.status_code == 200
+    assert 'data-group="today"' in planned.text
+    assert "📅 planned" in planned.text and ">Unplan<" in planned.text
+    # hidden from Today once snoozed; deadline-free planning survives
+    snoozed = await client.post(f"/tasks/{tid}/snooze", data={"until": "tomorrow 9am", "view": "today"})
+    assert "schedule me" not in snoozed.text
+    open_page = await client.get("/open")
+    assert "schedule me" in open_page.text and "😴 snoozed until" in open_page.text
+    awake = await client.post(f"/tasks/{tid}/unsnooze", data={"view": "today"})
+    assert "schedule me" in awake.text and "snoozed until" not in awake.text
+    cleared = await client.post(f"/tasks/{tid}/plan", data={"date": "", "view": "inbox"})
+    assert 'data-group="inbox"' in cleared.text and "📅 planned" not in cleared.text
+    # a date via the picker form
+    dated = await client.post(f"/tasks/{tid}/plan", data={"date": "2026-12-24", "view": "upcoming"})
+    assert "📅 planned 2026-12-24" in dated.text
+    past = await client.post(f"/tasks/{tid}/snooze", data={"until": "2020-01-01T09:00", "view": "today"})
+    assert past.status_code == 400
 
 
 async def test_web_detail_edit_and_stale_conflict(client: AsyncClient) -> None:

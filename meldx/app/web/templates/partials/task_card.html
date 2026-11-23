@@ -5,16 +5,45 @@
   </div>
   {% if task.description %}<p class="text-sm text-slate-400 mt-3 whitespace-pre-wrap break-words">{{ task.description }}</p>{% endif %}
   {% if task.agent_id %}<p class="text-xs text-teal-300 mt-3">{{ task.agent_id }}</p>{% endif %}
+  <div class="flex flex-wrap gap-2 mt-2 text-xs">
+    {% if task.planned_date %}<span class="rounded-full bg-slate-800 text-slate-300 px-2 py-1">📅 planned {{ task.planned_date }}</span>{% endif %}
+    {% if task.due_date %}<span class="rounded-full bg-amber-950 text-amber-300 px-2 py-1">⏰ due {{ task.due_date }}</span>{% endif %}
+    {% if task.due_at %}<span class="rounded-full bg-amber-950 text-amber-300 px-2 py-1">⏰ due {{ task.due_at.strftime("%d %b %H:%M") }} UTC</span>{% endif %}
+    {% if task.id|string in overdue_ids %}<span class="rounded-full bg-rose-950 text-rose-300 px-2 py-1">⚠ overdue</span>{% endif %}
+    {% if task.id|string in snoozed_ids %}<span class="rounded-full bg-slate-800 text-slate-400 px-2 py-1">😴 snoozed until {{ task.snoozed_until.strftime("%d %b %H:%M") }} UTC</span>{% endif %}
+  </div>
   {% if task.lease_expires_at %}<time datetime="{{ task.lease_expires_at.isoformat() }}" data-lease="{{ task.lease_expires_at.isoformat() }}{% if not task.lease_expires_at.tzinfo %}+00:00{% endif %}" class="block text-xs text-amber-300 mt-2">⏳ Calculating lease…</time>{% endif %}
   {% if task.completed_at %}<p class="text-xs text-slate-500 mt-2">✓ Completed {{ task.completed_at.strftime("%d %b %H:%M") }} UTC</p>{% endif %}
+  {% if task.status.value == 'done' %}
   <div class="flex gap-3 mt-4 items-center">
-    {% if task.status.value == 'done' %}
-      <button hx-post="/tasks/{{ task.id }}/reopen" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Undo</button>
-    {% else %}
-      {% if task.progress.value == 'ready' %}<button hx-post="/tasks/{{ task.id }}/start" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Start</button>{% endif %}
-      {% if agent_execution %}<button hx-post="/tasks/{{ task.id }}/claim" hx-include="#agent-id" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Claim</button>{% endif %}
-      <button hx-post="/tasks/{{ task.id }}/complete" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg bg-teal-950 text-teal-300 px-3 py-2">Complete</button>
-    {% endif %}
+    <button hx-post="/tasks/{{ task.id }}/reopen" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Undo</button>
     <a href="/tasks/{{ task.id }}" class="text-xs text-slate-400 underline">Details</a>
   </div>
+  {% else %}
+  <div class="flex flex-wrap gap-2 mt-4 items-center">
+    {% if task.progress.value == 'ready' %}<button hx-post="/tasks/{{ task.id }}/start" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Start</button>{% endif %}
+    {% if agent_execution %}<button hx-post="/tasks/{{ task.id }}/claim" hx-include="#agent-id, #current-view" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Claim</button>{% endif %}
+    <button hx-post="/tasks/{{ task.id }}/complete" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="text-xs rounded-lg bg-teal-950 text-teal-300 px-3 py-2">Complete</button>
+    <a href="/tasks/{{ task.id }}" class="text-xs text-slate-400 underline">Details</a>
+  </div>
+  <div class="flex flex-wrap gap-2 mt-3 items-center text-xs">
+    {% if task.id|string in snoozed_ids %}
+    <button hx-post="/tasks/{{ task.id }}/unsnooze" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="rounded-lg border border-slate-700 px-3 py-2">Unsnooze</button>
+    {% else %}
+    <button hx-post="/tasks/{{ task.id }}/plan" hx-vals='{"date": "today"}' hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="rounded-lg border border-slate-700 px-3 py-2">Plan today</button>
+    <button hx-post="/tasks/{{ task.id }}/plan" hx-vals='{"date": "tomorrow"}' hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="rounded-lg border border-slate-700 px-3 py-2">Tomorrow</button>
+    {% if task.planned_date %}<button hx-post="/tasks/{{ task.id }}/plan" hx-vals='{"date": ""}' hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="rounded-lg border border-slate-700 px-3 py-2">Unplan</button>{% endif %}
+    <form hx-post="/tasks/{{ task.id }}/plan" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="flex gap-2 items-center">
+      <label for="plan-date-{{ task.id }}" class="sr-only">Plan for a date</label>
+      <input type="date" id="plan-date-{{ task.id }}" name="date" class="rounded-lg bg-slate-900 border border-slate-700 px-2 py-1">
+      <button class="rounded-lg border border-slate-700 px-3 py-2">Plan date</button>
+    </form>
+    <form hx-post="/tasks/{{ task.id }}/snooze" hx-include="#current-view" hx-target="#task-board" hx-swap="innerHTML" class="flex gap-2 items-center">
+      <label for="snooze-until-{{ task.id }}" class="sr-only">Snooze until</label>
+      <input type="datetime-local" id="snooze-until-{{ task.id }}" name="until" required class="rounded-lg bg-slate-900 border border-slate-700 px-2 py-1">
+      <button class="rounded-lg border border-slate-700 px-3 py-2">Snooze</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
 </article>

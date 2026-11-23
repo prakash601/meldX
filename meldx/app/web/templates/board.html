@@ -3,6 +3,7 @@
 <form id="add-task" hx-post="/tasks" hx-target="#task-board" hx-swap="innerHTML" class="flex gap-3 mb-6">
   <label for="title" class="sr-only">Task title</label>
   <input id="title" name="title" required maxlength="300" placeholder="What needs doing?" class="flex-1 rounded-xl bg-slate-900 border border-slate-700 px-4 py-3">
+  <input type="hidden" name="view" value="{{ view }}">
   <button class="rounded-xl bg-teal-400 text-slate-950 font-semibold px-5">Add task</button>
 </form>
 {% if agent_execution %}
@@ -11,7 +12,8 @@
   <input id="agent-id" name="agent_id" value="codex-1" required class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
 </div>
 {% endif %}
-<div id="task-board" hx-get="/partials/tasks" hx-trigger="refresh, sse:task.created, sse:task.claimed, sse:task.completed, sse:task.updated" hx-swap="innerHTML" hx-sync="this:queue last">
-  {% include "partials/task_groups.html" %}
+<input type="hidden" id="current-view" name="view" value="{{ view }}">
+<div id="task-board" hx-get="/partials/tasks?view={{ view }}{% if view == 'completed' %}&days={{ completed_days }}{% endif %}" hx-trigger="refresh, sse:task.created, sse:task.claimed, sse:task.completed, sse:task.updated" hx-swap="innerHTML" hx-sync="this:queue last">
+  {% include "partials/board.html" %}
 </div>
 {% endblock %}

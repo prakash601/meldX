@@ -10,12 +10,20 @@
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen">
   <main class="max-w-6xl mx-auto px-6 py-10" hx-ext="sse" sse-connect="/api/events">
-    <header class="flex justify-between items-center mb-8">
+    <header class="flex justify-between items-center mb-4">
       <div><p class="text-teal-400 font-semibold tracking-widest">meldX</p>
         <h1 class="text-4xl font-semibold mt-2">Today</h1>
         <p class="text-slate-400 mt-2">One queue. Clear ownership. Keep moving.</p></div>
       <span id="connection" role="status" class="text-sm text-slate-400">Connecting…</span>
     </header>
+    {% if view is defined %}
+    <nav aria-label="Board views" class="flex gap-5 mb-8 text-sm border-b border-slate-800 pb-3">
+      {% set nav_items = [("today", "/", "Today"), ("inbox", "/inbox", "Inbox"), ("upcoming", "/upcoming", "Upcoming"), ("open", "/open", "All open"), ("completed", "/completed", "Completed")] %}
+      {% for key, href, label in nav_items %}
+      <a href="{{ href }}" class="{% if view == key %}text-teal-300 border-b-2 border-teal-300 pb-1{% else %}text-slate-400 hover:text-slate-200{% endif %}">{{ label }}</a>
+      {% endfor %}
+    </nav>
+    {% endif %}
     <p id="error" role="alert" class="text-rose-300 mb-4" hidden></p>
     {% block content %}{% endblock %}
   </main>
@@ -29,6 +37,16 @@
     countdowns();
     setInterval(countdowns, 1000);
     document.body.addEventListener('htmx:afterSwap', countdowns);
+    // Day rollover (plan F04.5): refetch date-based views at midnight and on
+    // browser focus after midnight. The server derives "today" from
+    // OWNER_TIMEZONE; the owner's browser is expected to be in that zone.
+    let lastDay = new Date().toDateString();
+    function checkRollover() {
+      const current = new Date().toDateString();
+      if (current !== lastDay) { lastDay = current; htmx.trigger('#task-board', 'refresh'); }
+    }
+    window.addEventListener('focus', checkRollover);
+    setInterval(checkRollover, 30000);
     document.body.addEventListener('htmx:sseOpen', () => {
       document.getElementById('connection').textContent = '● Live';
       // Refresh on every connection, including reconnects, to recover missed events.

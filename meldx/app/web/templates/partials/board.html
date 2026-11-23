@@ -1,0 +1,9 @@
+{% for label, tasks, key in sections %}
+<section aria-labelledby="heading-{{ key }}" data-group="{{ key }}" class="mt-8 first:mt-0">
+  <h2 id="heading-{{ key }}" class="text-lg font-semibold mb-4">{{ label }} <span class="text-slate-500 text-sm">{{ tasks|length }}</span></h2>
+  <div class="space-y-3 max-w-3xl">
+    {% for task in tasks %}{% include "partials/task_card.html" %}
+    {% else %}<p class="rounded-xl border border-dashed border-slate-800 p-6 text-sm text-slate-500">Nothing here.</p>{% endfor %}
+  </div>
+</section>
+{% endfor %}
