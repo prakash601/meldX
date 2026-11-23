@@ -80,16 +80,24 @@ def add(
 def list_tasks(
     today: Annotated[bool, typer.Option(help="Only tasks due today.")] = False,
     status: Annotated[TaskStatus | None, typer.Option(help="Filter by task status.")] = None,
+    view: Annotated[
+        str | None,
+        typer.Option(help="inbox|today|upcoming|open|overdue|missed|completed (owner timezone)."),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON for scripting.")] = False,
 ) -> None:
     """List tasks and their current owners."""
     params: dict[str, Any] = {"today_only": today}
     if status is not None:
         params["status"] = status.value
+    if view is not None:
+        params["view"] = view
     tasks = asyncio.run(_request("GET", "/api/tasks", params=params))
     if json_output:
         console.print_json(data=tasks)
         return
+    # Kept narrow on purpose: an 80-column terminal still shows the title.
+    # Planning/deadline details live in --json, `show`, and `today`.
     table = Table(title="meldX tasks")
     for heading in ("ID", "Title", "Status", "Priority", "Agent", "Lease until"):
         table.add_column(heading)
@@ -101,6 +109,78 @@ def list_tasks(
             )
         )
     console.print(table)
+
+
+@app.command()
+def today() -> None:
+    """What remains today, and what was finished today (owner timezone)."""
+    summary = asyncio.run(_request("GET", "/api/tasks/summary"))
+    console.print(Text(summary["date"], style="bold teal"))
+    for key, label in (
+        ("today", "Remaining today"),
+        ("overdue", "Overdue"),
+        ("missed_plans", "Missed plans"),
+        ("completed_today", "Completed today"),
+    ):
+        tasks = summary[key]
+        console.print(Text(f"{label} ({len(tasks)})", style="bold"))
+        for task in tasks:
+            console.print(f"  {task['title']}  [dim]({task['id']})[/dim]")
+
+
+@app.command()
+def completed(
+    days: Annotated[int, typer.Option(help="Window in owner-local days; 1 = today.")] = 1,
+) -> None:
+    """Done tasks filtered by completion time, newest first."""
+    tasks = asyncio.run(
+        _request("GET", "/api/tasks", params={"view": "completed", "completed_days": days})
+    )
+    if not tasks:
+        console.print(Text(f"Nothing completed in the last {days} day(s)."))
+        return
+    table = Table(title=f"Completed (last {days} day(s))")
+    for heading in ("ID", "Title", "Completed at"):
+        table.add_column(heading)
+    for task in tasks:
+        table.add_row(str(task["id"]), Text(task["title"]), Text(str(task.get("completed_at") or "—")))
+    console.print(table)
+
+
+@app.command()
+def plan(
+    task_id: Annotated[UUID, typer.Argument(help="Task UUID.")],
+    date: Annotated[str, typer.Argument(help="today, tomorrow, friday, or YYYY-MM-DD.")],
+) -> None:
+    """Plan a task for an owner-local date. Planning never sets a deadline."""
+    task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/plan", payload={"date": date}))
+    console.print_json(data=task)
+
+
+@app.command()
+def unplan(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
+    """Clear a task's planned date."""
+    task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/plan", payload={"date": None}))
+    console.print_json(data=task)
+
+
+@app.command()
+def snooze(
+    task_id: Annotated[UUID, typer.Argument(help="Task UUID.")],
+    until: Annotated[
+        str, typer.Argument(help="ISO datetime or e.g. 'tomorrow 9am'; naive means owner-local.")
+    ],
+) -> None:
+    """Hide a task until an instant. The deadline is preserved."""
+    task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/snooze", payload={"until": until}))
+    console.print_json(data=task)
+
+
+@app.command()
+def unsnooze(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
+    """Show a snoozed task again."""
+    task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/unsnooze"))
+    console.print_json(data=task)
 
 
 @app.command()

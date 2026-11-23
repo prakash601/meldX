@@ -6,13 +6,14 @@ import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy.exc import SQLAlchemyError
 
-from meldx.app import bus
+from meldx.app import bus, dates
 from meldx.app.api import agents, events, tasks
 from meldx.app.db import check_db, ensure_schema, get_engine, is_sqlite
 from meldx.app.mcp.tools import mcp as mcp_server
@@ -56,11 +57,12 @@ for an unparseable due/snooze string.
 """.strip()
 
 OPENAPI_TAGS = [
-    {"name": "tasks", "description": "Create, list, claim, complete, update, hand off, snooze."},
+    {"name": "tasks", "description": "Create, list, plan, edit, snooze, start, complete, reopen."},
     {"name": "agents", "description": "Minimal agent registry: who can hold a lease."},
     {"name": "events", "description": "Server-Sent Events for committed task mutations."},
     {"name": "health", "description": "Readiness probe backed by a database round-trip."},
-    {"name": "web", "description": "HTML/HTMX fragments serving the Today board."},
+    {"name": "settings", "description": "Owner timezone and enabled capabilities. No secrets."},
+    {"name": "web", "description": "HTML/HTMX pages and fragments serving the board views."},
 ]
 
 
@@ -92,6 +94,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging()
     logger = logging.getLogger("meldx")
     get_engine()  # fail fast on bad DATABASE_URL
+    dates.owner_zone()  # fail fast on a bad OWNER_TIMEZONE (F01.5)
     if is_sqlite():
         # No server to start: create the schema the Alembic Postgres migration
         # cannot create here, and say plainly which guarantee is not covered.
@@ -156,6 +159,22 @@ def create_app(
             "SELECT 1 ok", extra={"event": "db.select_1", "status": "ok"}
         )
         return {"ok": True}
+
+    @app.get(
+        "/api/settings",
+        tags=["settings"],
+        summary="Service settings",
+        description="Owner timezone and enabled capabilities for clients. No secrets.",
+    )
+    async def settings() -> dict[str, Any]:
+        return {
+            "timezone": dates.owner_timezone(),
+            "lease_minutes": svc.lease_minutes(),
+            "capabilities": {
+                "mcp": mcp_enabled,
+                "agent_execution": execution_enabled,
+            },
+        }
 
     @app.exception_handler(ValueError)
     async def task_error(request: Request, exc: ValueError) -> JSONResponse:

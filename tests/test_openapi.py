@@ -18,7 +18,7 @@ def test_info_has_description_and_version() -> None:
 
 def test_all_documented_tags_are_declared() -> None:
     declared = {tag["name"] for tag in SPEC["tags"]}
-    assert declared == {"tasks", "agents", "events", "health", "web"}
+    assert declared == {"tasks", "agents", "events", "health", "settings", "web"}
 
     used = {
         tag

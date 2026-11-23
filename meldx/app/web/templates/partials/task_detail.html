@@ -8,6 +8,7 @@
   {% set shown_title = draft.title if conflict else task.title %}
   {% set shown_description = draft.description if conflict else task.description %}
   {% set shown_priority = draft.priority if conflict else task.priority.value %}
+  {% set shown_due_date = draft.due_date if conflict else (task.due_date.isoformat() if task.due_date else "") %}
   <div class="flex justify-between gap-3 items-start">
     <h2 class="text-xl font-medium break-words">{{ shown_title }}</h2>
     <span class="text-xs rounded-full px-2 py-1 {% if shown_priority == 'high' %}bg-rose-950 text-rose-300{% elif shown_priority == 'med' %}bg-amber-950 text-amber-300{% else %}bg-slate-800 text-slate-400{% endif %}">{{ shown_priority }}</span>
@@ -18,6 +19,10 @@
     <div><dt class="inline text-slate-600">lifecycle</dt> <dd class="inline">{{ task.lifecycle.value }}</dd></div>
     <div><dt class="inline text-slate-600">progress</dt> <dd class="inline">{{ task.progress.value }}</dd></div>
     <div><dt class="inline text-slate-600">revision</dt> <dd class="inline">{{ task.revision }}</dd></div>
+    {% if task.planned_date %}<div><dt class="inline text-slate-600">planned</dt> <dd class="inline">{{ task.planned_date }}</dd></div>{% endif %}
+    {% if task.due_date %}<div><dt class="inline text-slate-600">due</dt> <dd class="inline">{{ task.due_date }} (date)</dd></div>{% endif %}
+    {% if task.due_at %}<div><dt class="inline text-slate-600">due</dt> <dd class="inline">{{ task.due_at.isoformat() }}</dd></div>{% endif %}
+    {% if task.snoozed_until %}<div><dt class="inline text-slate-600">snoozed until</dt> <dd class="inline">{{ task.snoozed_until.isoformat() }}</dd></div>{% endif %}
     {% if task.agent_id %}<div><dt class="inline text-slate-600">agent</dt> <dd class="inline">{{ task.agent_id }}</dd></div>{% endif %}
     {% if task.completed_at %}<div><dt class="inline text-slate-600">completed</dt> <dd class="inline">{{ task.completed_at.isoformat() }}</dd></div>{% endif %}
   </dl>
@@ -29,13 +34,18 @@
     <label class="block text-sm text-slate-400">Description
       <textarea name="description" rows="4" class="mt-1 w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">{{ shown_description or "" }}</textarea>
     </label>
-    <label class="block text-sm text-slate-400">Priority
-      <select name="priority" class="mt-1 rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
-        <option value="low" {% if shown_priority == 'low' %}selected{% endif %}>low</option>
-        <option value="med" {% if shown_priority == 'med' %}selected{% endif %}>med</option>
-        <option value="high" {% if shown_priority == 'high' %}selected{% endif %}>high</option>
-      </select>
-    </label>
+    <div class="flex gap-4">
+      <label class="block text-sm text-slate-400">Priority
+        <select name="priority" class="mt-1 rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
+          <option value="low" {% if shown_priority == 'low' %}selected{% endif %}>low</option>
+          <option value="med" {% if shown_priority == 'med' %}selected{% endif %}>med</option>
+          <option value="high" {% if shown_priority == 'high' %}selected{% endif %}>high</option>
+        </select>
+      </label>
+      <label class="block text-sm text-slate-400">Deadline (date)
+        <input type="date" name="due_date" value="{{ shown_due_date or "" }}" class="mt-1 rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
+      </label>
+    </div>
     <div class="flex gap-3 items-center">
       <button class="rounded-xl bg-teal-400 text-slate-950 font-semibold px-5 py-2">Save</button>
       <a href="/tasks/{{ task.id }}" class="text-sm text-slate-400 underline">Cancel</a>

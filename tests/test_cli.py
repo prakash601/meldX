@@ -79,6 +79,52 @@ def test_list_filters_and_json(mock_api) -> None:
     assert json.loads(result.stdout)[0]["title"] == "literal [red]task"
 
 
+def test_list_view_param(mock_api) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params) == {"today_only": "false", "view": "overdue"}
+        return httpx.Response(200, json=[])
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["list", "--view", "overdue"])
+    assert result.exit_code == 0, result.output
+
+
+def test_today_prints_summary_sections(mock_api) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/tasks/summary"
+        return httpx.Response(
+            200,
+            json={
+                "date": "2026-11-24",
+                "today": [{"id": TID, "title": "write plan"}],
+                "overdue": [],
+                "missed_plans": [],
+                "completed_today": [{"id": TID, "title": "shipped v0.0.1"}],
+            },
+        )
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["today"])
+    assert result.exit_code == 0, result.output
+    assert "2026-11-24" in result.stdout
+    assert "Remaining today (1)" in result.stdout and "write plan" in result.stdout
+    assert "Completed today (1)" in result.stdout and "shipped v0.0.1" in result.stdout
+    assert "Overdue (0)" in result.stdout
+
+
+def test_completed_uses_view_and_window(mock_api) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params) == {"view": "completed", "completed_days": "7"}
+        return httpx.Response(
+            200, json=[{"id": TID, "title": "older work", "completed_at": "2026-11-20T10:00:00Z"}]
+        )
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["completed", "--days", "7"])
+    assert result.exit_code == 0, result.output
+    assert "older work" in result.stdout
+
+
 @pytest.mark.parametrize(
     "command,payload,path",
     [
@@ -86,6 +132,10 @@ def test_list_filters_and_json(mock_api) -> None:
         (["start", TID], None, f"/api/tasks/{TID}/start"),
         (["reopen", TID], None, f"/api/tasks/{TID}/reopen"),
         (["claim", TID, "--agent", "codex-1"], {"agent_id": "codex-1"}, f"/api/tasks/{TID}/claim"),
+        (["plan", TID, "tomorrow"], {"date": "tomorrow"}, f"/api/tasks/{TID}/plan"),
+        (["unplan", TID], {"date": None}, f"/api/tasks/{TID}/plan"),
+        (["snooze", TID, "tomorrow 9am"], {"until": "tomorrow 9am"}, f"/api/tasks/{TID}/snooze"),
+        (["unsnooze", TID], None, f"/api/tasks/{TID}/unsnooze"),
     ],
 )
 def test_mutation_commands(mock_api, command, payload, path) -> None:

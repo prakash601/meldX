@@ -5,11 +5,11 @@ Spec: docs/data-model.md (local-only for now).
 """
 
 import enum
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, Column, Index, UniqueConstraint
+from sqlalchemy import JSON, CheckConstraint, Column, Date, Index, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -82,6 +82,7 @@ class TaskFields(SQLModel):
 
 class TaskCreate(TaskFields):
     due_at: str | None = None
+    due_date: str | None = None
     delegate_to: str | None = Field(default=None, min_length=1)
 
 
@@ -89,7 +90,15 @@ class TaskUpdate(SQLModel):
     title: str | None = Field(default=None, min_length=1, max_length=300)
     description: str | None = None
     priority: Priority | None = None
+    due_at: str | None = None
+    due_date: str | None = None
     expected_revision: int | None = Field(default=None, ge=1)
+
+
+class TaskPlan(SQLModel):
+    """Set the planned date, or null to clear it (product plan §4.1)."""
+
+    date: str | None = Field(default=None, min_length=1)
 
 
 class TaskClaim(SQLModel):
@@ -117,6 +126,16 @@ class Task(TaskFields, table=True):
         Index("ix_tasks_status_due", "status", "due_at"),
         Index("ix_tasks_lease", "lease_expires_at"),
         Index("ix_tasks_lifecycle_progress", "lifecycle", "progress"),
+        Index("ix_tasks_planned_date", "planned_date"),
+        Index("ix_tasks_due_date", "due_date"),
+        Index("ix_tasks_snoozed_until", "snoozed_until"),
+        Index("ix_tasks_completed_at", "completed_at"),
+        # A deadline is a date-only value OR an exact instant, never both
+        # (product plan §4.2: never silently invent a time for a date).
+        CheckConstraint(
+            "NOT (due_at IS NOT NULL AND due_date IS NOT NULL)",
+            name="ck_tasks_single_deadline",
+        ),
     )
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
@@ -127,6 +146,12 @@ class Task(TaskFields, table=True):
     lifecycle: TaskLifecycle = Field(default=TaskLifecycle.open)
     progress: TaskProgress = Field(default=TaskProgress.ready)
     revision: int = Field(default=1)
+    # v0.0.2 scheduling (ADR-0004): planned date and date-only deadline are
+    # owner-local calendar dates; snooze hides until an instant without
+    # touching either deadline representation.
+    planned_date: date | None = Field(default=None, sa_column=Column(Date))
+    due_date: date | None = Field(default=None, sa_column=Column(Date))
+    snoozed_until: datetime | None = Field(default=None)
     agent_id: str | None = Field(default=None, foreign_key="agents.id")
     lease_expires_at: datetime | None = Field(default=None)
     due_at: datetime | None = None
