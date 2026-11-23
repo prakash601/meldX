@@ -33,17 +33,20 @@ class JSONFormatter(logging.Formatter):
 
 
 DESCRIPTION = """
-One shared todo queue that humans and agents can claim and complete without colliding.
+One shared todo queue for one owner and any connected agents.
 
-One process serves four interfaces over the same task services: MCP at `/mcp`
-(Streamable HTTP, seven `todo_*` tools for ChatGPT, Codex, OpenCode, Hermes), REST
-at `/api` (tasks, agents, SSE), the Jinja2 + HTMX Today board at `/`, and a
-readiness probe at `/health` that runs `SELECT 1`.
+One process serves the personal task service: REST at `/api` (tasks, agents,
+SSE), the Jinja2 + HTMX Today board at `/`, and a readiness probe at `/health`
+that runs `SELECT 1`. The MCP transport at `/mcp` (Streamable HTTP) and the
+agent-execution routes (`claim`, `handoff`) are opt-in: set `ENABLE_MCP=true` or
+`ENABLE_AGENT_EXECUTION=true` to register them. The standalone personal service
+boots with both off.
 
-Lease semantics: `POST /api/tasks/{task_id}/claim` takes an exclusive lease
-(`LEASE_MINUTES`, default 30) inside a `FOR UPDATE SKIP LOCKED` transaction. A task
-with an unexpired lease held by another agent cannot be claimed; once the lease
-expires the task becomes claimable again. `complete` clears the owner and lease.
+Lease semantics (execution enabled): `POST /api/tasks/{task_id}/claim` takes an
+exclusive lease (`LEASE_MINUTES`, default 30) inside a `FOR UPDATE SKIP LOCKED`
+transaction. A task with an unexpired lease held by another agent cannot be
+claimed; once the lease expires the task becomes claimable again. `complete`
+clears the owner and lease.
 
 Task errors mirror the MCP tool messages verbatim so clients can switch transports
 without changing their handling: `404` for an unknown task id (`Task locked or not
@@ -101,13 +104,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     bus.init_bus()  # fresh event queue per boot
     # Mounted sub-apps don't get their lifespan run — nest it manually so the
-    # streamable-HTTP task group starts.
-    async with app.state.mcp_app.router.lifespan_context(app.state.mcp_app):
+    # streamable-HTTP task group starts when the MCP transport is enabled.
+    mcp_app = getattr(app.state, "mcp_app", None)
+    if mcp_app is None:
         yield
+    else:
+        async with mcp_app.router.lifespan_context(mcp_app):
+            yield
 
 
-def create_app() -> FastAPI:
-    mcp_app = mcp_server.streamable_http_app(transport_security=mcp_transport_security())
+def _flag(env: str, override: bool | None) -> bool:
+    """Explicit argument wins; otherwise ENABLE_* env vars, default off."""
+    if override is not None:
+        return override
+    return os.environ.get(env, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def create_app(
+    *, enable_mcp: bool | None = None, enable_agent_execution: bool | None = None
+) -> FastAPI:
+    mcp_enabled = _flag("ENABLE_MCP", enable_mcp)
+    execution_enabled = _flag("ENABLE_AGENT_EXECUTION", enable_agent_execution)
+    mcp_app = (
+        mcp_server.streamable_http_app(transport_security=mcp_transport_security())
+        if mcp_enabled
+        else None
+    )
     app = FastAPI(
         title="meldX",
         version="0.0.1",
@@ -115,6 +137,7 @@ def create_app() -> FastAPI:
         openapi_tags=OPENAPI_TAGS,
     )
     app.state.mcp_app = mcp_app
+    app.state.agent_execution = execution_enabled
     app.router.lifespan_context = lifespan
 
     @app.get(
@@ -157,11 +180,18 @@ def create_app() -> FastAPI:
     # so anything registered after it would be unreachable.
     app.include_router(events.router, prefix="/api")
     app.include_router(tasks.router, prefix="/api")
+    if execution_enabled:
+        app.include_router(tasks.execution_router, prefix="/api")
     app.include_router(agents.router, prefix="/api")
     app.include_router(web.router)
+    if execution_enabled:
+        app.include_router(web.execution_router)
 
-    # MCP Streamable HTTP for ChatGPT/OpenCode/Hermes (inner route /mcp)
-    app.mount("/", mcp_app)
+    # MCP Streamable HTTP for ChatGPT/OpenCode/Hermes (inner route /mcp).
+    # Opt-in: the standalone personal service boots without it (product plan
+    # §6.1 — MCP is aligned with the finished service at v0.0.5).
+    if mcp_app is not None:
+        app.mount("/", mcp_app)
 
     return app
 

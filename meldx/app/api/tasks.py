@@ -18,6 +18,9 @@ from meldx.app.models import (
 from meldx.app.services import tasks as svc
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+# Agent-execution surface (claim/handoff): registered only when
+# ENABLE_AGENT_EXECUTION is set — see main.create_app (product plan §6.1).
+execution_router = APIRouter(prefix="/tasks", tags=["tasks"])
 Session = Annotated[AsyncSession, Depends(get_session)]
 
 # Documented once and attached to every task route. These mirror the MCP tool
@@ -60,7 +63,7 @@ async def create_task(request: Request, payload: TaskCreate, session: Session) -
     return await svc.create_task(session, **payload.model_dump())
 
 
-@router.post(
+@execution_router.post(
     "/{task_id}/claim",
     summary="Claim a task",
     description="Takes an exclusive lease for `agent_id` and sets `status=doing`. "
@@ -94,7 +97,7 @@ async def update_task(task_id: str, payload: TaskUpdate, session: Session) -> Ta
     return await svc.update_task(session, task_id=task_id, **payload.model_dump())
 
 
-@router.post(
+@execution_router.post(
     "/{task_id}/handoff",
     summary="Hand off a task",
     description="Reassigns `agent_id` to `to_agent`, returns the task to `today`, "

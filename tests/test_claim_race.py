@@ -96,7 +96,7 @@ async def test_rest_claim_race_and_locked_status(pg_sessions) -> None:
         async with pg_sessions() as session:
             yield session
 
-    app = create_app()
+    app = create_app(enable_agent_execution=True)
     app.dependency_overrides[get_session] = test_session
     async with pg_sessions() as session:
         task = await svc.create_task(session, title=f"REST race-{uuid.uuid4().hex[:8]}")
