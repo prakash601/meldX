@@ -12,17 +12,16 @@ transaction. SSE publishes only after commit.
 import hashlib
 import json
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-import dateparser
 from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from meldx.app import bus
+from meldx.app import bus, dates
 from meldx.app.models import (
     ActorType,
     Agent,
@@ -86,18 +85,25 @@ def _aware(dt: datetime | None) -> datetime | None:
 
 
 def parse_due(value: str | None) -> datetime | None:
+    """Owner-local instant (product plan §4.2): ISO 8601 or natural language;
+    a naive value means the OWNER's timezone, not the server's."""
     if value is None:
         return None
-    try:
-        dt = datetime.fromisoformat(value)
-    except ValueError:
-        parsed = dateparser.parse(value)
-        if parsed is None:
-            raise ValueError(f"Cannot parse due date: {value!r}") from None
-        dt = parsed
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt
+    return dates.parse_instant(value)
+
+
+def parse_due_date(value: str | None) -> date | None:
+    if value is None:
+        return None
+    return dates.parse_date(value)
+
+
+def _guard_single_deadline(*, due_at: datetime | None, due_date: date | None) -> None:
+    """A deadline is an exact instant OR a calendar date, never both."""
+    if due_at is not None and due_date is not None:
+        raise ValueError(
+            "A deadline is either an exact time or a date, not both; clear one first"
+        )
 
 
 def _coerce_id(task_id: str) -> UUID:
@@ -206,6 +212,7 @@ async def create_task(
     title: str,
     description: str | None = None,
     due_at: str | None = None,
+    due_date: str | None = None,
     priority: str = "med",
     delegate_to: str | None = None,
     idempotency_client: str = "local",
@@ -217,12 +224,16 @@ async def create_task(
     title = title.strip()
     if not title:
         raise ValueError("Title cannot be empty")
+    parsed_due_at = parse_due(due_at)
+    parsed_due_date = parse_due_date(due_date)
+    _guard_single_deadline(due_at=parsed_due_at, due_date=parsed_due_date)
     request_hash: str | None = None
     if idempotency_key is not None:
         request_hash = _request_hash(
             title=title,
             description=description,
             due_at=due_at,
+            due_date=due_date,
             priority=priority,
             delegate_to=delegate_to,
         )
@@ -236,7 +247,8 @@ async def create_task(
         title=title,
         description=description,
         priority=Priority(priority),
-        due_at=parse_due(due_at),
+        due_at=parsed_due_at,
+        due_date=parsed_due_date,
     )
     if delegate_to is not None:
         await ensure_agent(session, delegate_to)
@@ -248,7 +260,7 @@ async def create_task(
         _record(
             task.id,
             action="created",
-            changed=("title", "description", "priority", "due_at"),
+            changed=("title", "description", "priority", "due_at", "due_date"),
         )
     )
     if idempotency_key is not None and request_hash is not None:
@@ -487,14 +499,19 @@ async def update_task(
     title: str | None = None,
     description: str | None = None,
     priority: str | None = None,
+    due_at: str | None = None,
+    due_date: str | None = None,
     description_provided: bool = False,
+    due_at_provided: bool = False,
+    due_date_provided: bool = False,
     expected_revision: int | None = None,
 ) -> Task:
     """Edit with optimistic concurrency and explicit-null handling.
 
-    `description_provided` distinguishes an omitted field (leave unchanged)
-    from an explicit null (clear). `expected_revision` mismatch -> 409 carrying
-    the current task so the client can reload.
+    `*_provided` distinguishes an omitted field (leave unchanged) from an
+    explicit null (clear). Deadlines keep their mutual exclusion: an exact
+    instant OR a calendar date, never both. `expected_revision` mismatch ->
+    409 carrying the current task so the client can reload.
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
     if expected_revision is not None and expected_revision != task.revision:
@@ -503,6 +520,13 @@ async def update_task(
         title = title.strip()
         if not title:
             raise ValueError("Title cannot be empty")
+    target_due_at = task.due_at
+    target_due_date = task.due_date
+    if due_at_provided:
+        target_due_at = parse_due(due_at)  # explicit null clears
+    if due_date_provided:
+        target_due_date = parse_due_date(due_date)
+    _guard_single_deadline(due_at=target_due_at, due_date=target_due_date)
     changed: list[str] = []
     if title is not None and title != task.title:
         task.title = title
@@ -513,6 +537,12 @@ async def update_task(
     if priority is not None and Priority(priority) is not task.priority:
         task.priority = Priority(priority)
         changed.append("priority")
+    if target_due_at != task.due_at:
+        task.due_at = target_due_at
+        changed.append("due_at")
+    if target_due_date != task.due_date:
+        task.due_date = target_due_date
+        changed.append("due_date")
     if not changed:
         return task
     _touch(task)
@@ -550,17 +580,202 @@ async def handoff_task(
 
 
 async def snooze_task(session: AsyncSession, *, task_id: str, until: str) -> Task:
+    """Hide until an instant. The deadline is PRESERVED (product plan §4.1).
+
+    The pre-v0.0.2 behavior stored the wake-up time in `due_at`, destroying
+    the deadline; the migration copies those legacy values into
+    `snoozed_until` once, with uncertain provenance (ADR-004). Snoozing into
+    the past is rejected.
+    """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    instant = dates.parse_instant(until)
+    if instant <= _now():
+        raise ValueError(f"Cannot snooze into the past: {until!r}")
     task.status = TaskStatus.snoozed
-    task.due_at = parse_due(until)
+    task.snoozed_until = instant
     task.agent_id = None
     task.lease_expires_at = None
     _touch(task)
     session.add(task)
-    session.add(_record(
-            task.id, action="snoozed", changed=("status", "due_at")
-        ))
+    session.add(
+        _record(
+            task.id, action="snoozed", changed=("status", "snoozed_until")
+        )
+    )
     await session.commit()
     await session.refresh(task)
     bus.publish("task.updated", task)
     return task
+
+
+async def plan_task(session: AsyncSession, *, task_id: str, date: str | None) -> Task:
+    """Set the owner-local planned date, or clear it with None (plan §4.1).
+
+    Planning is independent of deadlines: a planned task needs no due date.
+    While the task is open and ready, the legacy status follows the plan —
+    planned for today reads as the legacy `today` marker; any other date (or
+    none) reads as `inbox`.
+    """
+    task = await _get_or_locked(session, _coerce_id(task_id))
+    planned = parse_due_date(date)
+    task.planned_date = planned
+    if task.lifecycle is TaskLifecycle.open and task.progress is TaskProgress.ready:
+        if planned is not None and planned == dates.today_date():
+            task.status = TaskStatus.today
+        else:
+            task.status = TaskStatus.inbox
+    _touch(task)
+    session.add(task)
+    session.add(_record(task.id, action="planned", changed=("planned_date",)))
+    await session.commit()
+    await session.refresh(task)
+    bus.publish("task.updated", task)
+    return task
+
+
+async def unsnooze_task(session: AsyncSession, *, task_id: str) -> Task:
+    """Show a snoozed task again. Idempotent for tasks that are visible.
+
+    The legacy status returns to `today` when the plan says today, else
+    `inbox`; the owner replans rather than the service guessing (plan §4.3).
+    """
+    task = await _get_or_locked(session, _coerce_id(task_id))
+    if task.snoozed_until is None:
+        return task
+    task.snoozed_until = None
+    if task.lifecycle is TaskLifecycle.open and task.progress is TaskProgress.ready:
+        if task.planned_date is not None and task.planned_date == dates.today_date():
+            task.status = TaskStatus.today
+        else:
+            task.status = TaskStatus.inbox
+    _touch(task)
+    session.add(task)
+    session.add(_record(task.id, action="unsnoozed"))
+    await session.commit()
+    await session.refresh(task)
+    bus.publish("task.updated", task)
+    return task
+
+
+VIEW_NAMES = ("today", "inbox", "upcoming", "open", "overdue", "missed", "completed")
+
+
+def _snoozed_active(task: Task, now: datetime) -> bool:
+    until = _aware(task.snoozed_until)
+    return until is not None and until > now
+
+
+def _planned_today(task: Task, today: date) -> bool:
+    return task.planned_date is not None and task.planned_date == today
+
+
+def _due_today(task: Task, today: date) -> bool:
+    return dates.is_due_today(_aware(task.due_at), task.due_date, today)
+
+
+def _legacy_today_marker(task: Task) -> bool:
+    """Pre-v0.0.2 `today` rows carry no calendar date: keep them visible in
+    Today for owner review instead of inventing a planned date (ADR-004)."""
+    return task.status is TaskStatus.today and task.planned_date is None
+
+
+def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> list[Task]:
+    """View membership per product plan §4.3. All views are open-lifecycle
+    unless stated. Snoozed tasks stay hidden until their instant passes —
+    expiry is derived at query time, no scheduler needed."""
+    now = _now()
+    today = dates.today_date()
+    _, day_end = dates.local_day_bounds(today)
+
+    if view == "inbox":
+        # No planned date and no deadline; the legacy today marker keeps
+        # delegated/legacy rows out. Visibility is derived from
+        # snoozed_until, so an EXPIRED snooze lands back in Inbox even
+        # though the legacy status column still says `snoozed` (plan §4.3).
+        return [
+            t
+            for t in tasks
+            if t.lifecycle is TaskLifecycle.open
+            and t.progress is TaskProgress.ready
+            and not _snoozed_active(t, now)
+            and not _legacy_today_marker(t)
+            and t.planned_date is None
+            and t.due_date is None
+            and _aware(t.due_at) is None
+        ]
+    if view == "today":
+        return [
+            t
+            for t in tasks
+            if t.lifecycle is TaskLifecycle.open
+            and not _snoozed_active(t, now)
+            and (_planned_today(t, today) or _due_today(t, today) or _legacy_today_marker(t))
+        ]
+    if view == "overdue":
+        # Snoozed stays discoverable here with its badge (plan §4.3).
+        return [
+            t
+            for t in tasks
+            if t.lifecycle is TaskLifecycle.open and dates.is_overdue(_aware(t.due_at), t.due_date)
+        ]
+    if view == "missed":
+        return [
+            t
+            for t in tasks
+            if t.lifecycle is TaskLifecycle.open
+            and t.planned_date is not None
+            and t.planned_date < today
+        ]
+    if view == "upcoming":
+        return [
+            t
+            for t in tasks
+            if t.lifecycle is TaskLifecycle.open
+            and (
+                (t.planned_date is not None and t.planned_date > today)
+                or (t.due_date is not None and t.due_date > today)
+                or (_aware(t.due_at) is not None and _aware(t.due_at) >= day_end)  # type: ignore[operator]
+            )
+        ]
+    if view == "open":
+        return [t for t in tasks if t.lifecycle is TaskLifecycle.open]
+    if view == "completed":
+        start = dates.local_day_bounds(today - timedelta(days=max(completed_days, 1) - 1))[0]
+
+        def completed_in_range(task: Task) -> bool:
+            completed = _aware(task.completed_at)
+            return completed is not None and start <= completed
+
+        return [t for t in tasks if t.lifecycle is TaskLifecycle.done and completed_in_range(t)]
+    raise ValueError(f"Unknown view: {view!r}")
+
+
+async def view_tasks(
+    session: AsyncSession, *, view: str, completed_days: int = 1, limit: int | None = 200
+) -> list[Task]:
+    """Explicit view queries with the §4.3 membership rules. Bounded scan of
+    the personal list; the legacy `status`/`today_only` filters keep their old
+    UTC semantics for existing consumers (ADR-004 compatibility #7)."""
+    if view not in VIEW_NAMES:
+        raise ValueError(f"Unknown view: {view!r}")
+    tasks = await list_tasks(session, limit=1000)
+    filtered = _view_filter(view, tasks, completed_days=completed_days)
+    if limit is not None:
+        filtered = filtered[:limit]
+    return filtered
+
+
+async def today_summary(session: AsyncSession) -> dict[str, Any]:
+    """What remains today, and what was finished today (product plan F06).
+
+    Memberships overlap by design; counts are per-view and must not be
+    summed as a unique total (F06.4).
+    """
+    tasks = await list_tasks(session, limit=1000)
+    return {
+        "date": dates.today_date().isoformat(),
+        "today": _view_filter("today", tasks),
+        "overdue": _view_filter("overdue", tasks),
+        "missed_plans": _view_filter("missed", tasks),
+        "completed_today": _view_filter("completed", tasks),
+    }

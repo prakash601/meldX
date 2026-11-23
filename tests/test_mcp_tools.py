@@ -93,7 +93,9 @@ async def test_update_handoff_snooze(db_file: str) -> None:
     snoozed = await t.todo_snooze(tid, "tomorrow 9am")
     assert snoozed["status"] == "snoozed"
     assert snoozed["agent_id"] is None
-    assert snoozed["due_at"] is not None
+    # v0.0.2 (plan §4.1): snooze hides until an instant and PRESERVES the
+    # deadline instead of overwriting due_at.
+    assert snoozed["snoozed_until"] is not None
 
 
 @pytest.mark.asyncio

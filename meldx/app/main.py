@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy.exc import SQLAlchemyError
 
-from meldx.app import bus
+from meldx.app import bus, dates
 from meldx.app.api import agents, events, tasks
 from meldx.app.db import check_db, ensure_schema, get_engine, is_sqlite
 from meldx.app.mcp.tools import mcp as mcp_server
@@ -92,6 +92,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging()
     logger = logging.getLogger("meldx")
     get_engine()  # fail fast on bad DATABASE_URL
+    dates.owner_zone()  # fail fast on a bad OWNER_TIMEZONE (F01.5)
     if is_sqlite():
         # No server to start: create the schema the Alembic Postgres migration
         # cannot create here, and say plainly which guarantee is not covered.
