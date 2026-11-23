@@ -1,4 +1,5 @@
 """SSE broadcast of committed task mutations. No replay; clients refresh on reconnect."""
+
 import asyncio
 import json
 from collections.abc import AsyncIterator
@@ -28,7 +29,20 @@ async def _gen(request: Request, take: int | None) -> AsyncIterator[dict[str, st
                 return
 
 
-@router.get("/events")
-async def events(request: Request, take: int | None = Query(default=None, ge=1)) -> EventSourceResponse:
+@router.get(
+    "/events",
+    tags=["events"],
+    summary="Stream task events",
+    description=(
+        "Server-Sent Events for committed mutations: `task.created`, `task.claimed`, "
+        "`task.completed`, `task.updated`. Each `data` payload is a JSON object with "
+        "`event`, `task_id`, `status`, and `agent_id`. A `ping` event is sent every "
+        "15s to keep the connection alive. There is no replay, so reconnecting clients "
+        "should refetch current state. `take=N` closes the stream after N task events."
+    ),
+)
+async def events(
+    request: Request, take: int | None = Query(default=None, ge=1)
+) -> EventSourceResponse:
     """Stream future events to each subscriber; take=N closes after N task events."""
     return EventSourceResponse(_gen(request, take))
