@@ -13,17 +13,18 @@ Hand-adjusted (ADR-004, following the 18414bef9d7d enum pattern):
   inbox|today|snoozed keep the open/ready defaults (legacy planning
   markers are preserved, never invented).
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 import sqlmodel
-from alembic import op
 from sqlalchemy.dialects import postgresql
 
+from alembic import op
+
 revision: str = 'd88a912adfbd'
-down_revision: Union[str, Sequence[str], None] = '18414bef9d7d'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = '18414bef9d7d'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 TASKLIFECYCLE = postgresql.ENUM('open', 'done', name='tasklifecycle')
 TASKPROGRESS = postgresql.ENUM('ready', 'doing', name='taskprogress')

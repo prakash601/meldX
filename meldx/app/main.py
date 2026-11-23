@@ -163,7 +163,15 @@ def create_app(
         code = 400
         if isinstance(exc, svc.TaskNotFound):
             code = 404
-        elif isinstance(exc, svc.TaskLocked) or message.startswith("Task leased to "):
+        elif isinstance(
+            exc,
+            (
+                svc.TaskLocked,
+                svc.TaskStateConflict,
+                svc.IdempotencyConflict,
+                svc.StaleRevision,
+            ),
+        ) or message.startswith("Task leased to "):
             code = 409
         logging.getLogger("meldx.api").warning(
             "task request failed",
@@ -174,7 +182,11 @@ def create_app(
                 "status": code,
             },
         )
-        return JSONResponse(status_code=code, content={"detail": message})
+        content: dict[str, object] = {"detail": message}
+        if isinstance(exc, svc.StaleRevision):
+            # Enough current state for the client to reload and reapply.
+            content["current_task"] = exc.task.model_dump(mode="json")
+        return JSONResponse(status_code=code, content=content)
 
     # API routes BEFORE the "/" mount: a root mount matches every path,
     # so anything registered after it would be unreachable.

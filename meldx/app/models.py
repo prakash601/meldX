@@ -89,6 +89,7 @@ class TaskUpdate(SQLModel):
     title: str | None = Field(default=None, min_length=1, max_length=300)
     description: str | None = None
     priority: Priority | None = None
+    expected_revision: int | None = Field(default=None, ge=1)
 
 
 class TaskClaim(SQLModel):

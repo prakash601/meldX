@@ -2,7 +2,7 @@
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from meldx.app.db import get_session
@@ -30,8 +30,10 @@ CLIENT_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"description": "No task with that id. `detail` is `Task locked or not found`."},
     409: {
         "description": (
-            "Locked by a concurrent claim, or leased to another agent. `detail` is "
-            "`Task locked or not found` or `Task leased to {agent} until {ts}`."
+            "Conflict. `detail` is `Task locked or not found` (row locked by a "
+            "concurrent claim), `Task leased to {agent} until {ts}`, `Stale revision: "
+            "task is at revision {n}` (with `current_task` to reload), `Task is done; "
+            "reopen it first`, or an idempotency-key payload mismatch."
         )
     },
 }
@@ -40,13 +42,20 @@ CLIENT_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 @router.get(
     "",
     summary="List tasks",
-    description="Newest last. `status` filters by exact status; `today_only` keeps "
-    "unfinished tasks whose `due_at` falls on today's date (UTC).",
+    description="Stable order (oldest first). `status` filters by exact status; "
+    "`today_only` keeps unfinished tasks whose `due_at` falls on today's date "
+    "(UTC). Bounded: `limit` default 50, max 200, with `offset` paging.",
 )
 async def list_tasks(
-    session: Session, status: TaskStatus | None = None, today_only: bool = False
+    session: Session,
+    status: TaskStatus | None = None,
+    today_only: bool = False,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[Task]:
-    return await svc.list_tasks(session, status=status, today_only=today_only)
+    return await svc.list_tasks(
+        session, status=status, today_only=today_only, limit=limit, offset=offset
+    )
 
 
 @router.post(
@@ -55,12 +64,48 @@ async def list_tasks(
     summary="Create a task",
     description="Creates an `inbox` task. Supplying `delegate_to` assigns the agent "
     "and starts the task in `today`. `due_at` accepts ISO 8601 or natural language "
-    "such as `tomorrow 9am`.",
+    "such as `tomorrow 9am`. Send an `Idempotency-Key` header to retry safely: the "
+    "same key and payload replay the same task; the same key with a different "
+    "payload returns 409.",
     responses=CLIENT_ERROR_RESPONSES,
 )
 async def create_task(request: Request, payload: TaskCreate, session: Session) -> Task:
     request.state.agent_id = payload.delegate_to
-    return await svc.create_task(session, **payload.model_dump())
+    key = request.headers.get("idempotency-key") or None
+    return await svc.create_task(session, **payload.model_dump(), idempotency_key=key)
+
+
+@router.get(
+    "/{task_id}",
+    summary="Fetch a task",
+    description="The exact task including `revision`, `lifecycle`, and `progress`. "
+    "Missing or invalid ids use the shared task contract message.",
+    responses=CLIENT_ERROR_RESPONSES,
+)
+async def get_task(task_id: str, session: Session) -> Task:
+    return await svc.get_task(session, task_id=task_id)
+
+
+@router.post(
+    "/{task_id}/start",
+    summary="Start a task",
+    description="Personal doing: sets `progress=doing` with no agent identity and no "
+    "lease. Idempotent. A done task returns 409 with `Task is done; reopen it first`.",
+    responses=CLIENT_ERROR_RESPONSES,
+)
+async def start_task(task_id: str, session: Session) -> Task:
+    return await svc.start_task(session, task_id=task_id)
+
+
+@router.post(
+    "/{task_id}/reopen",
+    summary="Reopen a task",
+    description="Returns a done task to open/ready and clears `completed_at`; the "
+    "activity history is preserved. Idempotent for tasks that are already open.",
+    responses=CLIENT_ERROR_RESPONSES,
+)
+async def reopen_task(task_id: str, session: Session) -> Task:
+    return await svc.reopen_task(session, task_id=task_id)
 
 
 @execution_router.post(
@@ -88,13 +133,28 @@ async def complete_task(task_id: str, session: Session) -> Task:
 
 @router.patch(
     "/{task_id}",
-    summary="Update a task",
+    summary="Edit a task",
     description="Updates `title`, `description`, or `priority`. Omitted fields are "
-    "left unchanged; status moves only through claim/complete/handoff/snooze.",
+    "left unchanged; an explicit `null` clears `description`. Send "
+    "`expected_revision` to detect stale edits: a mismatch returns 409 with the "
+    "current task as `current_task` so the client can reload and reapply.",
     responses=CLIENT_ERROR_RESPONSES,
 )
 async def update_task(task_id: str, payload: TaskUpdate, session: Session) -> Task:
-    return await svc.update_task(session, task_id=task_id, **payload.model_dump())
+    fields = payload.model_fields_set
+    if "title" in fields and payload.title is None:
+        raise HTTPException(status_code=422, detail="title cannot be null")
+    if "priority" in fields and payload.priority is None:
+        raise HTTPException(status_code=422, detail="priority cannot be null")
+    return await svc.update_task(
+        session,
+        task_id=task_id,
+        title=payload.title,
+        description=payload.description,
+        priority=payload.priority,
+        description_provided="description" in fields,
+        expected_revision=payload.expected_revision,
+    )
 
 
 @execution_router.post(

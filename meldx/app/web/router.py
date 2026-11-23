@@ -21,7 +21,9 @@ Session = Annotated[AsyncSession, Depends(get_session)]
 
 
 async def board(request: Request, session: AsyncSession, template: str) -> HTMLResponse:
-    tasks = await svc.list_tasks(session)
+    # Bounded at the documented API maximum; the board must not silently drop
+    # cards to pagination (v0.0.3 replaces this with real paging).
+    tasks = await svc.list_tasks(session, limit=200)
     groups = {
         status.value: [t for t in tasks if t.status == status]
         for status in (TaskStatus.inbox, TaskStatus.today, TaskStatus.doing)

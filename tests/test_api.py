@@ -125,6 +125,84 @@ async def test_update_handoff_snooze(client: AsyncClient) -> None:
     assert snoozed.json()["agent_id"] is None
 
 
+async def test_detail_start_reopen_flow(client: AsyncClient) -> None:
+    created = (await client.post("/api/tasks", json={"title": "focus work"})).json()
+    tid = created["id"]
+    detail = await client.get(f"/api/tasks/{tid}")
+    assert detail.status_code == 200
+    assert detail.json()["revision"] == 1
+    assert detail.json()["lifecycle"] == "open"
+    assert detail.json()["progress"] == "ready"
+    missing = await client.get("/api/tasks/00000000-0000-0000-0000-000000000000")
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "Task locked or not found"}
+
+    started = await client.post(f"/api/tasks/{tid}/start")
+    assert started.json()["progress"] == "doing"
+    assert started.json()["status"] == "doing"
+    again = await client.post(f"/api/tasks/{tid}/start")
+    assert again.json()["revision"] == started.json()["revision"]  # idempotent
+
+    done = await client.post(f"/api/tasks/{tid}/complete")
+    assert done.json()["lifecycle"] == "done"
+    refused = await client.post(f"/api/tasks/{tid}/start")
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "Task is done; reopen it first"
+    reopened = await client.post(f"/api/tasks/{tid}/reopen")
+    assert reopened.json()["lifecycle"] == "open"
+    assert reopened.json()["completed_at"] is None
+    assert reopened.json()["revision"] > done.json()["revision"]
+
+
+async def test_patch_revision_and_null_semantics(client: AsyncClient) -> None:
+    created = await client.post("/api/tasks", json={"title": "doc", "description": "v1"})
+    tid = created.json()["id"]
+    cleared = await client.patch(f"/api/tasks/{tid}", json={"description": None})
+    assert cleared.json()["description"] is None
+    patched = await client.patch(f"/api/tasks/{tid}", json={"title": "doc v2"})
+    assert patched.json()["description"] is None  # omitted keeps the cleared value
+    assert patched.json()["revision"] == 3  # create=1, clear=2, rename=3
+
+    assert (await client.patch(f"/api/tasks/{tid}", json={"title": None})).status_code == 422
+    assert (await client.patch(f"/api/tasks/{tid}", json={"priority": None})).status_code == 422
+
+    stale = await client.patch(
+        f"/api/tasks/{tid}", json={"title": "stale edit", "expected_revision": 1}
+    )
+    assert stale.status_code == 409
+    body = stale.json()
+    assert body["detail"] == "Stale revision: task is at revision 3"
+    assert body["current_task"]["title"] == "doc v2"
+    # reapply with the fresh revision succeeds
+    ok = await client.patch(
+        f"/api/tasks/{tid}", json={"title": "stale edit", "expected_revision": 3}
+    )
+    assert ok.json()["title"] == "stale edit"
+
+
+async def test_idempotency_key_replay_and_conflict(client: AsyncClient) -> None:
+    headers = {"Idempotency-Key": "cli-retry-1"}
+    first = await client.post("/api/tasks", json={"title": "retry me"}, headers=headers)
+    assert first.status_code == 201
+    replay = await client.post("/api/tasks", json={"title": "retry me"}, headers=headers)
+    assert replay.status_code == 201
+    assert replay.json()["id"] == first.json()["id"]
+    conflict = await client.post("/api/tasks", json={"title": "different"}, headers=headers)
+    assert conflict.status_code == 409
+    assert "already used with a different payload" in conflict.json()["detail"]
+    listing = (await client.get("/api/tasks")).json()
+    assert [t["title"] for t in listing] == ["retry me"]
+
+
+async def test_list_is_bounded(client: AsyncClient) -> None:
+    for i in range(3):
+        await client.post("/api/tasks", json={"title": f"page {i}"})
+    page = (await client.get("/api/tasks?limit=2&offset=1")).json()
+    assert [t["title"] for t in page] == ["page 1", "page 2"]
+    assert (await client.get("/api/tasks?limit=0")).status_code == 422
+    assert (await client.get("/api/tasks?limit=201")).status_code == 422
+
+
 async def test_today_groups_actions_and_escaping(client: AsyncClient) -> None:
     first = (await client.post("/api/tasks", json={"title": "<script>alert(1)</script>"})).json()
     delegated = (
