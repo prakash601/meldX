@@ -189,11 +189,14 @@ def test_import_apply_posts_to_apply_endpoint(mock_api, tmp_path) -> None:
 
 def test_import_rejects_bad_policy_and_file(mock_api, tmp_path) -> None:
     result = runner.invoke(cli.app, ["import", str(tmp_path / "missing.json")])
-    assert result.exit_code == 1 and "Cannot read" in result.stderr
+    # Rich wraps stderr at the terminal width, so flatten before matching.
+    flattened = result.stderr.replace("\n", " ")
+    assert result.exit_code == 1 and "Cannot read" in flattened
     bogus = tmp_path / "bogus.json"
     bogus.write_text("not json")
     result = runner.invoke(cli.app, ["import", str(bogus)])
-    assert result.exit_code == 1 and "not valid JSON" in result.stderr
+    flattened = result.stderr.replace("\n", " ")
+    assert result.exit_code == 1 and "not valid JSON" in flattened
     good = tmp_path / "good.json"
     good.write_text("{}")
     result = runner.invoke(cli.app, ["import", str(good), "--policy", "merge"])
