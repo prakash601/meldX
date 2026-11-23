@@ -82,16 +82,24 @@ def list_tasks(
     status: Annotated[TaskStatus | None, typer.Option(help="Filter by task status.")] = None,
     view: Annotated[
         str | None,
-        typer.Option(help="inbox|today|upcoming|open|overdue|missed|completed (owner timezone)."),
+        typer.Option(help="inbox|today|upcoming|open|overdue|missed|completed|archive (owner timezone)."),
     ] = None,
+    search: Annotated[
+        str | None, typer.Option("--search", "-q", help="Case-insensitive title/description text.")
+    ] = None,
+    priority: Annotated[Priority | None, typer.Option(help="Filter by priority.")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON for scripting.")] = False,
 ) -> None:
-    """List tasks and their current owners."""
+    """List tasks; combine view, search, and priority filters."""
     params: dict[str, Any] = {"today_only": today}
     if status is not None:
         params["status"] = status.value
     if view is not None:
         params["view"] = view
+    if search is not None:
+        params["q"] = search
+    if priority is not None:
+        params["priority"] = priority.value
     tasks = asyncio.run(_request("GET", "/api/tasks", params=params))
     if json_output:
         console.print_json(data=tasks)

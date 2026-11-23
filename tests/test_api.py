@@ -307,6 +307,37 @@ async def test_web_archive_navigation_and_buttons(client: AsyncClient) -> None:
     assert "to archive" in restored.text and 'data-group="inbox"' in restored.text
 
 
+async def test_web_search_and_filters_on_open(client: AsyncClient) -> None:
+    await client.post("/api/tasks", json={"title": "findable report", "priority": "high"})
+    await client.post("/api/tasks", json={"title": "other report"})
+    page = await client.get("/open")
+    assert page.status_code == 200 and 'id="q"' in page.text  # the filter form
+    filtered = await client.get("/open?q=findable&priority=high")
+    assert "findable report" in filtered.text and "other report" not in filtered.text
+    fragment = await client.get("/partials/tasks?view=open&q=findable&priority=high")
+    assert "findable report" in fragment.text and "<html" not in fragment.text
+
+
+async def test_activity_endpoint_and_detail_timeline(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "history task"})).json()["id"]
+    await client.post(f"/api/tasks/{tid}/start")
+    await client.post(f"/api/tasks/{tid}/complete")
+    history = await client.get(f"/api/tasks/{tid}/activity")
+    assert history.status_code == 200
+    assert [row["action"] for row in history.json()["activity"]] == [
+        "created",
+        "started",
+        "completed",
+    ]
+    assert all("title" not in row and "description" not in row for row in history.json()["activity"])
+    missing = await client.get("/api/tasks/00000000-0000-0000-0000-000000000000/activity")
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "Task locked or not found"
+    detail = await client.get(f"/tasks/{tid}")
+    assert detail.status_code == 200
+    assert 'id="activity-heading"' in detail.text and ">completed<" in detail.text
+
+
 async def test_today_groups_actions_and_escaping(client: AsyncClient) -> None:
     first = (await client.post("/api/tasks", json={"title": "<script>alert(1)</script>"})).json()
     delegated = (

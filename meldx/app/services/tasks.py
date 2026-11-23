@@ -302,13 +302,34 @@ async def list_tasks(
     *,
     status: str | None = None,
     today_only: bool = False,
+    q: str | None = None,
+    priority: str | None = None,
+    include_archived: bool = False,
     limit: int | None = 50,
     offset: int = 0,
 ) -> list[Task]:
-    """Stable order (created_at, id) with bounded pagination; None = unbounded."""
+    """Stable order (created_at, id) with bounded pagination; None = unbounded.
+
+    `q` searches title/description case-insensitively with SQL wildcards
+    escaped — user input is never a pattern. Archived rows are excluded
+    unless explicitly requested (the archive view is the only ordinary
+    consumer that asks for them).
+    """
     stmt = select(Task).order_by(col(Task.created_at), col(Task.id))
+    if not include_archived:
+        stmt = stmt.where(col(Task.archived_at).is_(None))
     if status is not None:
         stmt = stmt.where(col(Task.status) == TaskStatus(status))
+    if priority is not None:
+        stmt = stmt.where(col(Task.priority) == Priority(priority))
+    if q:
+        needle = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        stmt = stmt.where(
+            or_(
+                col(Task.title).ilike(f"%{needle}%", escape="\\"),
+                col(Task.description).ilike(f"%{needle}%", escape="\\"),
+            )
+        )
     tasks = list((await session.exec(stmt)).all())
     if today_only:
         today = _now().date()
@@ -324,6 +345,14 @@ async def list_tasks(
     if limit is not None:
         tasks = tasks[:limit]
     return tasks
+
+
+def _matches_q(task: Task, q: str) -> bool:
+    """In-memory twin of the SQL search for the view paths (personal scale)."""
+    needle = q.casefold()
+    return needle in (task.title or "").casefold() or needle in (
+        task.description or ""
+    ).casefold()
 
 
 async def claim_task(session: AsyncSession, *, task_id: str, agent_id: str) -> Task:
@@ -832,18 +861,64 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
 
 
 async def view_tasks(
-    session: AsyncSession, *, view: str, completed_days: int = 1, limit: int | None = 200
+    session: AsyncSession,
+    *,
+    view: str,
+    completed_days: int = 1,
+    q: str | None = None,
+    priority: str | None = None,
+    limit: int | None = 200,
 ) -> list[Task]:
-    """Explicit view queries with the §4.3 membership rules. Bounded scan of
-    the personal list; the legacy `status`/`today_only` filters keep their old
-    UTC semantics for existing consumers (ADR-004 compatibility #7)."""
+    """Explicit view queries with the §4.3 membership rules, optionally
+    narrowed by search text and priority. Bounded scan of the personal list;
+    the legacy `status`/`today_only` filters keep their old UTC semantics for
+    existing consumers (ADR-004 compatibility #7)."""
     if view not in VIEW_NAMES:
         raise ValueError(f"Unknown view: {view!r}")
-    tasks = await list_tasks(session, limit=1000)
+    tasks = await list_tasks(session, limit=1000, include_archived=True)
+    if q:
+        tasks = [t for t in tasks if _matches_q(t, q)]
+    if priority is not None:
+        wanted = Priority(priority)
+        tasks = [t for t in tasks if t.priority is wanted]
     filtered = _view_filter(view, tasks, completed_days=completed_days)
     if limit is not None:
         filtered = filtered[:limit]
     return filtered
+
+
+async def task_activity(
+    session: AsyncSession, *, task_id: str, limit: int = 100, offset: int = 0
+) -> dict[str, Any]:
+    """Durable history for one task (v0.0.3 exposure of the v0.0.1
+    foundation). Stable order; missing ids keep the contract message."""
+    tid = _coerce_id(task_id)
+    await _get_or_locked(session, tid)  # 404 for unknown tasks, not empty list
+    stmt = (
+        select(TaskActivity)
+        .where(col(TaskActivity.task_id) == tid)
+        .order_by(col(TaskActivity.occurred_at), col(TaskActivity.id))
+    )
+    rows = list((await session.exec(stmt)).all())
+    if offset:
+        rows = rows[offset:]
+    if limit is not None:
+        rows = rows[:limit]
+    return {
+        "task_id": str(tid),
+        "activity": [
+            {
+                "id": str(row.id),
+                "action": row.action,
+                "actor_type": row.actor_type.value,
+                "actor_id": row.actor_id,
+                "occurred_at": row.occurred_at.isoformat() if row.occurred_at else None,
+                "request_id": row.request_id,
+                "changed_fields": row.changed_fields,
+            }
+            for row in rows
+        ],
+    }
 
 
 async def today_summary(session: AsyncSession) -> dict[str, Any]:

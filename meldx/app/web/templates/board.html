@@ -12,6 +12,21 @@
   <input id="agent-id" name="agent_id" value="codex-1" required class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
 </div>
 {% endif %}
+{% if view in ('open', 'archive') %}
+<form hx-get="/partials/tasks" hx-target="#task-board" hx-swap="innerHTML" class="flex flex-wrap gap-3 mb-6">
+  <input type="hidden" name="view" value="{{ view }}">
+  <label for="q" class="sr-only">Search title or description</label>
+  <input id="q" name="q" value="{{ q or "" }}" maxlength="200" placeholder="Search title or description…" class="flex-1 rounded-xl bg-slate-900 border border-slate-700 px-4 py-2">
+  <label for="priority-filter" class="sr-only">Priority filter</label>
+  <select id="priority-filter" name="priority" class="rounded-xl bg-slate-900 border border-slate-700 px-3 py-2">
+    <option value="">any priority</option>
+    <option value="low" {% if priority == 'low' %}selected{% endif %}>low</option>
+    <option value="med" {% if priority == 'med' %}selected{% endif %}>med</option>
+    <option value="high" {% if priority == 'high' %}selected{% endif %}>high</option>
+  </select>
+  <button class="rounded-xl border border-slate-700 px-4">Filter</button>
+</form>
+{% endif %}
 <input type="hidden" id="current-view" name="view" value="{{ view }}">
 <div id="task-board" hx-get="/partials/tasks?view={{ view }}{% if view == 'completed' %}&days={{ completed_days }}{% endif %}" hx-trigger="refresh, sse:task.created, sse:task.claimed, sse:task.completed, sse:task.updated" hx-swap="innerHTML" hx-sync="this:queue last">
   {% include "partials/board.html" %}

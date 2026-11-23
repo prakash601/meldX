@@ -89,6 +89,23 @@ def test_list_view_param(mock_api) -> None:
     assert result.exit_code == 0, result.output
 
 
+def test_list_search_and_priority_params(mock_api) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params) == {
+            "today_only": "false",
+            "view": "open",
+            "q": "rest",
+            "priority": "high",
+        }
+        return httpx.Response(200, json=[])
+
+    mock_api(handler)
+    result = runner.invoke(
+        cli.app, ["list", "--view", "open", "--search", "rest", "--priority", "high"]
+    )
+    assert result.exit_code == 0, result.output
+
+
 def test_today_prints_summary_sections(mock_api) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/tasks/summary"
