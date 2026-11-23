@@ -101,6 +101,13 @@ class TaskPlan(SQLModel):
     date: str | None = Field(default=None, min_length=1)
 
 
+class TaskImport(SQLModel):
+    """Apply or preview an import (plan F10). `data` is an export document."""
+
+    policy: str = Field(default="skip")  # skip | replace
+    data: dict[str, Any]
+
+
 class TaskClaim(SQLModel):
     agent_id: str = Field(min_length=1)
 

@@ -1,7 +1,9 @@
 """Typer commands backed by the shared REST API, locally or on Render."""
 
 import asyncio
+import json
 import os
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -252,6 +254,40 @@ def edit(
         payload["priority"] = priority.value
     task = asyncio.run(_request("PATCH", f"/api/tasks/{task_id}", payload=payload))
     console.print_json(data=task)
+
+
+@app.command()
+def export() -> None:
+    """Print a full export document (tasks + history) as JSON."""
+    data = asyncio.run(_request("GET", "/api/export"))
+    console.print_json(data=data)
+
+
+@app.command("import")
+def import_tasks(
+    file: Annotated[Path, typer.Argument(help="Export JSON file to import.")],
+    policy: Annotated[
+        str, typer.Option(help="Duplicates: skip (default) or replace (explicit).")
+    ] = "skip",
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Preview only; nothing is written.")
+    ] = False,
+) -> None:
+    """Import an export file. Preview first; apply is transactional."""
+    if policy not in ("skip", "replace"):
+        error_console.print(Text("Policy must be 'skip' or 'replace'."))
+        raise typer.Exit(1)
+    try:
+        data = json.loads(file.read_text())
+    except OSError:
+        error_console.print(Text(f"Cannot read {file}."))
+        raise typer.Exit(1) from None
+    except ValueError:
+        error_console.print(Text(f"{file} is not valid JSON."))
+        raise typer.Exit(1) from None
+    endpoint = "/api/import/preview" if dry_run else "/api/import"
+    result = asyncio.run(_request("POST", endpoint, payload={"policy": policy, "data": data}))
+    console.print_json(data=result)
 
 
 @app.command()

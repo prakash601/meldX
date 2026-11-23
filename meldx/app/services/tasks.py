@@ -935,3 +935,220 @@ async def today_summary(session: AsyncSession) -> dict[str, Any]:
         "missed_plans": _view_filter("missed", tasks),
         "completed_today": _view_filter("completed", tasks),
     }
+
+
+EXPORT_SCHEMA_VERSION = 1
+
+# Fields a `replace`-policy import overwrites on an existing row. Identity
+# (id), history, and the audit trail columns stay managed by the service.
+_REPLACE_FIELDS = (
+    "title",
+    "description",
+    "priority",
+    "status",
+    "lifecycle",
+    "progress",
+    "revision",
+    "planned_date",
+    "due_date",
+    "due_at",
+    "snoozed_until",
+    "archived_at",
+    "agent_id",
+    "lease_expires_at",
+    "parent_id",
+    "created_at",
+    "updated_at",
+    "completed_at",
+)
+
+
+def _task_from_import(row: dict[str, Any]) -> Task:
+    payload = {key: value for key, value in row.items() if key != "activity"}
+    return Task.model_validate(payload)
+
+
+def _activity_from_import(row: dict[str, Any], task_id: UUID) -> TaskActivity:
+    payload = dict(row)
+    payload["task_id"] = task_id
+    payload["actor_type"] = ActorType(payload.get("actor_type", ActorType.owner.value))
+    return TaskActivity.model_validate(payload)
+
+
+async def export_data(session: AsyncSession) -> dict[str, Any]:
+    """Full data portability snapshot (plan F10.1): every task — archived
+    included — with its durable history and stable IDs. No credentials exist
+    in task data; agent identity is a plain id."""
+    tasks = await list_tasks(session, limit=1000, include_archived=True)
+    exported: list[dict[str, Any]] = []
+    for task in tasks:
+        history = await task_activity(session, task_id=str(task.id), limit=1000)
+        dump = task.model_dump(mode="json")
+        dump["activity"] = history["activity"]
+        exported.append(dump)
+    return {
+        "schema_version": EXPORT_SCHEMA_VERSION,
+        "exported_at": _now().isoformat(),
+        "tasks": exported,
+    }
+
+
+async def _analyze_import(
+    session: AsyncSession, data: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate an import payload against the database WITHOUT writing.
+
+    Identity is only ever the task id — never a title guess (plan F10.3).
+    """
+    version = data.get("schema_version")
+    if version != EXPORT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported export schema version: {version!r}; expected {EXPORT_SCHEMA_VERSION}"
+        )
+    rows = data.get("tasks")
+    if not isinstance(rows, list):
+        # ValueError on purpose: the 400 contract reports payload-shape
+        # problems to the client like every other import error.
+        raise ValueError("Import payload has no tasks list")  # noqa: TRY004
+
+    prepared: list[tuple[Task, list[TaskActivity]]] = []
+    invalid_rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            invalid_rows.append({"index": index, "reason": "task entry is not an object"})
+            continue
+        try:
+            task = _task_from_import(row)
+            if not (task.title or "").strip():
+                raise ValueError("title is empty")
+            activity = [
+                _activity_from_import(entry, task.id)
+                for entry in row.get("activity", [])
+                if isinstance(entry, dict)
+            ]
+        except Exception as exc:  # noqa: BLE001 - reported per row, not raised
+            invalid_rows.append({"index": index, "reason": str(exc)})
+            continue
+        if str(task.id) in seen_ids:
+            invalid_rows.append(
+                {"index": index, "task_id": str(task.id), "reason": "duplicate id inside the file"}
+            )
+            continue
+        seen_ids.add(str(task.id))
+        prepared.append((task, activity))
+
+    new_entries: list[tuple[Task, list[TaskActivity]]] = []
+    duplicate_entries: list[tuple[Task, list[TaskActivity], Task]] = []
+    for task, activity in prepared:
+        existing = await session.get(Task, task.id)
+        if existing is None:
+            new_entries.append((task, activity))
+        else:
+            duplicate_entries.append((task, activity, existing))
+
+    missing_parents: list[dict[str, str]] = []
+    for task, _ in prepared:
+        if task.parent_id is None or str(task.parent_id) in seen_ids:
+            continue
+        found = await session.get(Task, task.parent_id)
+        if found is None:
+            missing_parents.append(
+                {"task_id": str(task.id), "parent_id": str(task.parent_id)}
+            )
+
+    return {
+        "valid": not invalid_rows and not missing_parents,
+        "schema_version": EXPORT_SCHEMA_VERSION,
+        "counts": {
+            "tasks_in_file": len(rows),
+            "new": len(new_entries),
+            "duplicates": len(duplicate_entries),
+            "invalid": len(invalid_rows),
+            "missing_parents": len(missing_parents),
+            "activity_rows": sum(len(activity) for _, activity in prepared),
+        },
+        "invalid_rows": invalid_rows,
+        "missing_parents": missing_parents,
+        "duplicates": [
+            {
+                "task_id": str(task.id),
+                "existing_revision": existing.revision,
+                "incoming_revision": task.revision,
+            }
+            for task, _, existing in duplicate_entries
+        ],
+        "_new": new_entries,
+        "_duplicates": duplicate_entries,
+    }
+
+
+async def import_preview(session: AsyncSession, data: dict[str, Any]) -> dict[str, Any]:
+    """Validate and report; writes nothing (plan F10.2)."""
+    report = await _analyze_import(session, data)
+    return {key: value for key, value in report.items() if not key.startswith("_")}
+
+
+async def import_data(
+    session: AsyncSession, data: dict[str, Any], *, policy: str = "skip"
+) -> dict[str, Any]:
+    """Apply an import transactionally (plan F10.2-10.4).
+
+    Default duplicate policy is skip; replace is an explicit choice and
+    respects revision checks. Identity is the task id only. On any problem
+    the whole import writes nothing.
+    """
+    if policy not in ("skip", "replace"):
+        raise ValueError("policy must be 'skip' or 'replace'")
+    analysis = await _analyze_import(session, data)
+    if not analysis["valid"]:
+        raise ValueError(
+            "Import file is invalid; nothing was written. Run import preview for the report"
+        )
+
+    # Stub agents without committing — one transaction for the whole import.
+    imported_tasks = [task for task, _ in analysis["_new"]]
+    imported_tasks += [task for task, _, _ in analysis["_duplicates"]]
+    agent_ids = sorted({task.agent_id for task in imported_tasks if task.agent_id})
+    for agent_id in agent_ids:
+        if await session.get(Agent, agent_id) is None:
+            prefix = agent_id.split("-")[0] if "-" in agent_id else agent_id
+            try:
+                kind = AgentType(prefix)
+            except ValueError:
+                kind = AgentType.chatgpt
+            session.add(Agent(id=agent_id, type=kind))
+
+    created = replaced = skipped = 0
+    for task, activity in analysis["_new"]:
+        session.add(task)
+        for row in activity:
+            session.add(row)
+        created += 1
+
+    for task, activity, existing in analysis["_duplicates"]:
+        if policy == "skip":
+            skipped += 1
+            continue
+        if task.revision < existing.revision:
+            raise ValueError(
+                f"Import aborted: task {task.id} is at revision {existing.revision}, "
+                f"newer than the imported {task.revision}; nothing was written"
+            )
+        for field in _REPLACE_FIELDS:
+            setattr(existing, field, getattr(task, field))
+        for row in await session.exec(
+            select(TaskActivity).where(col(TaskActivity.task_id) == existing.id)
+        ):
+            await session.delete(row)
+        for row in activity:
+            session.add(row)
+        session.add(existing)
+        replaced += 1
+
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise ValueError("Import failed a database constraint; nothing was written") from None
+    return {"policy": policy, "created": created, "replaced": replaced, "skipped": skipped}

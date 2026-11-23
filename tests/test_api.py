@@ -338,6 +338,30 @@ async def test_activity_endpoint_and_detail_timeline(client: AsyncClient) -> Non
     assert 'id="activity-heading"' in detail.text and ">completed<" in detail.text
 
 
+async def test_export_import_via_rest(client: AsyncClient) -> None:
+    created = (await client.post("/api/tasks", json={"title": "portable work"})).json()
+    exported = await client.get("/api/export")
+    assert exported.status_code == 200
+    document = exported.json()
+    assert document["schema_version"] == 1
+    assert [t["id"] for t in document["tasks"]] == [created["id"]]
+
+    preview = await client.post("/api/import/preview", json={"policy": "skip", "data": document})
+    assert preview.status_code == 200 and preview.json()["valid"] is True
+    assert preview.json()["counts"]["duplicates"] == 1  # the task already exists
+
+    applied = await client.post("/api/import", json={"policy": "skip", "data": document})
+    assert applied.status_code == 200
+    assert applied.json() == {"policy": "skip", "created": 0, "replaced": 0, "skipped": 1}
+
+    bad = await client.post("/api/import", json={"policy": "nope", "data": document})
+    assert bad.status_code == 400 and "policy must be" in bad.json()["detail"]
+    invalid = await client.post(
+        "/api/import", json={"policy": "skip", "data": {"schema_version": 99, "tasks": []}}
+    )
+    assert invalid.status_code == 400 and "Unsupported export schema version" in invalid.json()["detail"]
+
+
 async def test_today_groups_actions_and_escaping(client: AsyncClient) -> None:
     first = (await client.post("/api/tasks", json={"title": "<script>alert(1)</script>"})).json()
     delegated = (

@@ -142,6 +142,64 @@ def test_completed_uses_view_and_window(mock_api) -> None:
     assert "older work" in result.stdout
 
 
+def test_export_prints_document(mock_api) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/export"
+        return httpx.Response(
+            200, json={"schema_version": 1, "exported_at": "now", "tasks": []}
+        )
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["export"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["schema_version"] == 1
+
+
+def test_import_dry_run_posts_to_preview(mock_api, tmp_path) -> None:
+    document = {"schema_version": 1, "tasks": []}
+    source = tmp_path / "export.json"
+    source.write_text(json.dumps(document))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/import/preview"
+        assert json.loads(request.content) == {"policy": "skip", "data": document}
+        return httpx.Response(200, json={"valid": True, "counts": {"new": 0}})
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["import", str(source), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert '"valid": true' in result.stdout
+
+
+def test_import_apply_posts_to_apply_endpoint(mock_api, tmp_path) -> None:
+    document = {"schema_version": 1, "tasks": []}
+    source = tmp_path / "export.json"
+    source.write_text(json.dumps(document))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/import"
+        assert json.loads(request.content) == {"policy": "replace", "data": document}
+        return httpx.Response(200, json={"policy": "replace", "created": 0, "replaced": 1, "skipped": 0})
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["import", str(source), "--policy", "replace"])
+    assert result.exit_code == 0, result.output
+
+
+def test_import_rejects_bad_policy_and_file(mock_api, tmp_path) -> None:
+    result = runner.invoke(cli.app, ["import", str(tmp_path / "missing.json")])
+    assert result.exit_code == 1 and "Cannot read" in result.stderr
+    bogus = tmp_path / "bogus.json"
+    bogus.write_text("not json")
+    result = runner.invoke(cli.app, ["import", str(bogus)])
+    assert result.exit_code == 1 and "not valid JSON" in result.stderr
+    good = tmp_path / "good.json"
+    good.write_text("{}")
+    result = runner.invoke(cli.app, ["import", str(good), "--policy", "merge"])
+    assert result.exit_code == 1 and "Policy must be" in result.stderr
+
+
 @pytest.mark.parametrize(
     "command,payload,path",
     [
