@@ -10,7 +10,7 @@ SPEC = create_app().openapi()
 def test_info_has_description_and_version() -> None:
     info = SPEC["info"]
     assert info["title"] == "meldX"
-    assert info["version"] == "0.1.0"
+    assert info["version"] == "0.0.1"
     assert "FOR UPDATE SKIP LOCKED" in info["description"]
 
 

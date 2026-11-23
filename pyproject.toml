@@ -1,6 +1,6 @@
 [project]
 name = "meldx"
-version = "0.1.0"
+version = "0.0.1"
 description = "meldX — personal todo that agents can claim and complete"
 requires-python = ">=3.12"
 dependencies = [

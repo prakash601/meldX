@@ -110,7 +110,7 @@ def create_app() -> FastAPI:
     mcp_app = mcp_server.streamable_http_app(transport_security=mcp_transport_security())
     app = FastAPI(
         title="meldX",
-        version="0.1.0",
+        version="0.0.1",
         description=DESCRIPTION,
         openapi_tags=OPENAPI_TAGS,
     )
