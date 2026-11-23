@@ -11,6 +11,7 @@ from meldx.app.models import (
     TaskClaim,
     TaskCreate,
     TaskHandoff,
+    TaskPlan,
     TaskSnooze,
     TaskStatus,
     TaskUpdate,
@@ -42,17 +43,26 @@ CLIENT_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 @router.get(
     "",
     summary="List tasks",
-    description="Stable order (oldest first). `status` filters by exact status; "
-    "`today_only` keeps unfinished tasks whose `due_at` falls on today's date "
-    "(UTC). Bounded: `limit` default 50, max 200, with `offset` paging.",
+    description="Stable order (oldest first). `status` filters by exact status and "
+    "`today_only` keeps the LEGACY UTC-date semantics for existing consumers. "
+    "For the owner-local view semantics use `view`: `inbox`, `today`, `upcoming`, "
+    "`open`, `overdue`, `missed`, or `completed` (with `completed_days` window, "
+    "default today). `view` takes precedence over `status`/`today_only`. Bounded: "
+    "`limit` default 50, max 200, with `offset` paging.",
 )
 async def list_tasks(
     session: Session,
     status: TaskStatus | None = None,
     today_only: bool = False,
+    view: str | None = None,
+    completed_days: Annotated[int, Query(ge=1, le=366)] = 1,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[Task]:
+    if view is not None:
+        return await svc.view_tasks(
+            session, view=view, completed_days=completed_days, limit=limit
+        )
     return await svc.list_tasks(
         session, status=status, today_only=today_only, limit=limit, offset=offset
     )
@@ -64,15 +74,29 @@ async def list_tasks(
     summary="Create a task",
     description="Creates an `inbox` task. Supplying `delegate_to` assigns the agent "
     "and starts the task in `today`. `due_at` accepts ISO 8601 or natural language "
-    "such as `tomorrow 9am`. Send an `Idempotency-Key` header to retry safely: the "
-    "same key and payload replay the same task; the same key with a different "
-    "payload returns 409.",
+    "such as `tomorrow 9am` (owner-local when naive); `due_date` is a date-only "
+    "deadline with no invented time. A task has one deadline representation, "
+    "never both. Send an `Idempotency-Key` header to retry safely: the same key "
+    "and payload replay the same task; the same key with a different payload "
+    "returns 409.",
     responses=CLIENT_ERROR_RESPONSES,
 )
 async def create_task(request: Request, payload: TaskCreate, session: Session) -> Task:
     request.state.agent_id = payload.delegate_to
     key = request.headers.get("idempotency-key") or None
     return await svc.create_task(session, **payload.model_dump(), idempotency_key=key)
+
+
+@router.get(
+    "/summary",
+    summary="Today summary",
+    description="What remains and what was finished, in the owner's timezone: "
+    "separate `today`, `overdue`, `missed_plans`, and `completed_today` task "
+    "lists with the owner date. Memberships overlap by design; counts are "
+    "per-view and must not be summed as a unique total (plan F06).",
+)
+async def today_summary(session: Session) -> dict[str, Any]:
+    return await svc.today_summary(session)
 
 
 @router.get(
@@ -95,6 +119,30 @@ async def get_task(task_id: str, session: Session) -> Task:
 )
 async def start_task(task_id: str, session: Session) -> Task:
     return await svc.start_task(session, task_id=task_id)
+
+
+@router.post(
+    "/{task_id}/plan",
+    summary="Plan a task",
+    description="Set the owner-local planned date (`date`: ISO or natural language "
+    "such as `today`, `tomorrow`, `friday`), or send `null` to clear. Planning is "
+    "independent of deadlines — a planned task needs no due date. Planning for "
+    "today moves an inbox task into Today.",
+    responses=CLIENT_ERROR_RESPONSES,
+)
+async def plan_task(task_id: str, payload: TaskPlan, session: Session) -> Task:
+    return await svc.plan_task(session, task_id=task_id, date=payload.date)
+
+
+@router.post(
+    "/{task_id}/unsnooze",
+    summary="Show a snoozed task again",
+    description="Clears `snoozed_until`. The task returns to `today` when its plan "
+    "says today, else `inbox`. Idempotent for tasks that are already visible.",
+    responses=CLIENT_ERROR_RESPONSES,
+)
+async def unsnooze_task(task_id: str, session: Session) -> Task:
+    return await svc.unsnooze_task(session, task_id=task_id)
 
 
 @router.post(
@@ -134,10 +182,11 @@ async def complete_task(task_id: str, session: Session) -> Task:
 @router.patch(
     "/{task_id}",
     summary="Edit a task",
-    description="Updates `title`, `description`, or `priority`. Omitted fields are "
-    "left unchanged; an explicit `null` clears `description`. Send "
-    "`expected_revision` to detect stale edits: a mismatch returns 409 with the "
-    "current task as `current_task` so the client can reload and reapply.",
+    description="Updates `title`, `description`, `priority`, or the deadline. An "
+    "explicit `null` clears a nullable field. `due_at` (exact instant) and "
+    "`due_date` (date-only) are mutually exclusive — clear one before setting the "
+    "other. Send `expected_revision` to detect stale edits: a mismatch returns 409 "
+    "with the current task as `current_task` so the client can reload and reapply.",
     responses=CLIENT_ERROR_RESPONSES,
 )
 async def update_task(task_id: str, payload: TaskUpdate, session: Session) -> Task:
@@ -152,7 +201,11 @@ async def update_task(task_id: str, payload: TaskUpdate, session: Session) -> Ta
         title=payload.title,
         description=payload.description,
         priority=payload.priority,
+        due_at=payload.due_at,
+        due_date=payload.due_date,
         description_provided="description" in fields,
+        due_at_provided="due_at" in fields,
+        due_date_provided="due_date" in fields,
         expected_revision=payload.expected_revision,
     )
 

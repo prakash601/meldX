@@ -215,6 +215,69 @@ async def test_title_is_trimmed_and_whitespace_only_fails(client: AsyncClient) -
     assert blank_edit.json()["detail"] == "Title cannot be empty"
 
 
+async def test_plan_unsnooze_views_and_summary(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "plan via REST"})).json()["id"]
+    planned = await client.post(f"/api/tasks/{tid}/plan", json={"date": "today"})
+    assert planned.status_code == 200
+    assert planned.json()["planned_date"] is not None
+    assert planned.json()["status"] == "today"
+    cleared = await client.post(f"/api/tasks/{tid}/plan", json={"date": None})
+    assert cleared.json()["planned_date"] is None and cleared.json()["status"] == "inbox"
+
+    snoozed = await client.post(f"/api/tasks/{tid}/snooze", json={"until": "tomorrow 9am"})
+    assert snoozed.json()["snoozed_until"] is not None
+    assert snoozed.json()["due_at"] is None  # deadline preserved (was none)
+    assert (await client.get("/api/tasks?view=inbox")).json() == []
+    awake = await client.post(f"/api/tasks/{tid}/unsnooze")
+    assert awake.json()["snoozed_until"] is None and awake.json()["status"] == "inbox"
+
+    # Explicit views with the owner-local semantics.
+    assert [t["id"] for t in (await client.get("/api/tasks?view=inbox")).json()] == [tid]
+    assert (await client.get("/api/tasks?view=somewhere")).status_code == 400
+
+    # Static path registered before /{task_id}: summary answers, not a 404.
+    summary = await client.get("/api/tasks/summary")
+    assert summary.status_code == 200
+    body = summary.json()
+    assert body["date"]
+    assert [t["id"] for t in body["today"]] == []
+    assert body["overdue"] == [] and body["missed_plans"] == []
+    assert [t["id"] for t in body["completed_today"]] == []
+
+
+async def test_settings_reports_timezone_and_capabilities(client: AsyncClient) -> None:
+    settings = await client.get("/api/settings")
+    assert settings.status_code == 200
+    body = settings.json()
+    assert body["timezone"] == "Asia/Kolkata"
+    assert body["lease_minutes"] == 30
+    assert body["capabilities"] == {"mcp": False, "agent_execution": True}
+
+
+async def test_deadline_editing_and_mutual_exclusion(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "deadline edit"})).json()["id"]
+    by_date = await client.patch(f"/api/tasks/{tid}", json={"due_date": "2026-12-01"})
+    assert by_date.json()["due_date"] == "2026-12-01"
+    assert by_date.json()["due_at"] is None
+    conflict = await client.patch(f"/api/tasks/{tid}", json={"due_at": "2026-12-01T09:00:00Z"})
+    assert conflict.status_code == 400
+    assert "not both" in conflict.json()["detail"]
+    # switch representation: clear first, then set
+    cleared = await client.patch(f"/api/tasks/{tid}", json={"due_date": None})
+    assert cleared.json()["due_date"] is None
+    switched = await client.patch(f"/api/tasks/{tid}", json={"due_at": "tomorrow 9am"})
+    assert switched.json()["due_at"] is not None
+    # create rejects both at once
+    both = await client.post(
+        "/api/tasks", json={"title": "both", "due_at": "2026-12-01T09:00:00Z", "due_date": "2026-12-01"}
+    )
+    assert both.status_code == 400
+    assert "not both" in both.json()["detail"]
+    # date-only create works
+    dated = await client.post("/api/tasks", json={"title": "dated", "due_date": "2026-12-24"})
+    assert dated.json()["due_date"] == "2026-12-24"
+
+
 async def test_today_groups_actions_and_escaping(client: AsyncClient) -> None:
     first = (await client.post("/api/tasks", json={"title": "<script>alert(1)</script>"})).json()
     delegated = (
