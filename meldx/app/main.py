@@ -14,6 +14,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from meldx.app import auth as authz
 from meldx.app import bus, dates
 from meldx.app.api import agents, events, tasks
 from meldx.app.db import check_db, ensure_schema, get_engine, get_session, is_sqlite
@@ -97,6 +98,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger = logging.getLogger("meldx")
     get_engine()  # fail fast on bad DATABASE_URL
     dates.owner_zone()  # fail fast on a bad OWNER_TIMEZONE (F01.5)
+    if authz.bootstrap_secret() is None:
+        logger.warning(
+            "ENABLE_AUTH is on but OWNER_BOOTSTRAP_SECRET is missing; auth is a no-op. "
+            "Set the bootstrap secret before exposing the service.",
+            extra={"event": "auth.misconfigured", "status": "warn"},
+        )
+    elif not getattr(app.state, "auth", False):
+        logger.warning(
+            "authentication is DISABLED: safe only for loopback development. "
+            "Set ENABLE_AUTH=true before any non-local exposure.",
+            extra={"event": "auth.disabled", "status": "warn"},
+        )
     if is_sqlite():
         # No server to start: create the schema the Alembic Postgres migration
         # cannot create here, and say plainly which guarantee is not covered.
@@ -126,10 +139,16 @@ def _flag(env: str, override: bool | None) -> bool:
 
 
 def create_app(
-    *, enable_mcp: bool | None = None, enable_agent_execution: bool | None = None
+    *,
+    enable_mcp: bool | None = None,
+    enable_agent_execution: bool | None = None,
+    enable_auth: bool | None = None,
 ) -> FastAPI:
     mcp_enabled = _flag("ENABLE_MCP", enable_mcp)
     execution_enabled = _flag("ENABLE_AGENT_EXECUTION", enable_agent_execution)
+    auth_enabled = _flag("ENABLE_AUTH", enable_auth)
+    if auth_enabled and authz.bootstrap_secret() is None:
+        raise ValueError("ENABLE_AUTH requires OWNER_BOOTSTRAP_SECRET to be set")
     mcp_app = (
         mcp_server.streamable_http_app(transport_security=mcp_transport_security())
         if mcp_enabled
@@ -143,6 +162,8 @@ def create_app(
     )
     app.state.mcp_app = mcp_app
     app.state.agent_execution = execution_enabled
+    app.state.auth = auth_enabled
+    app.state.login_limiter = authz.LoginRateLimiter.from_env()
     app.router.lifespan_context = lifespan
 
     @app.get(
@@ -178,7 +199,28 @@ def create_app(
             },
         }
 
-    SessionDep = Annotated[AsyncSession, Depends(get_session)]
+    # v0.0.4 (plan §6.5): every task-data surface requires the owner. GETs
+    # need the read scope, mutations the write scope; a web session carries
+    # both. /health and /api/settings stay public (no task data, no secrets).
+    async def require_api_auth(
+        request: Request, session: Annotated[AsyncSession, Depends(get_session)]
+    ) -> None:
+        if not auth_enabled:
+            return
+        header = request.headers.get("authorization", "")
+        if header.startswith("Bearer "):
+            credential = await authz.verify_bearer_token(session, header[7:].strip())
+            if credential is None:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+            needed = (
+                authz.READ_SCOPE if request.method in {"GET", "HEAD", "OPTIONS"} else authz.WRITE_SCOPE
+            )
+            if needed not in credential.scopes:
+                raise HTTPException(status_code=403, detail=f"Credential lacks the {needed} scope")
+            return
+        cookie = request.cookies.get(authz.SESSION_COOKIE)
+        if await authz.verify_session_token(session, cookie) is None:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
     @app.get(
         "/api/export",
@@ -188,7 +230,10 @@ def create_app(
         "every task — archived included — with stable IDs, scheduling fields, and "
         "the durable activity history. No credentials exist in task data.",
     )
-    async def export_tasks(session: SessionDep) -> dict[str, Any]:
+    async def export_tasks(
+        session: Annotated[AsyncSession, Depends(get_session)],
+        _auth: Annotated[None, Depends(require_api_auth)],
+    ) -> dict[str, Any]:
         return await svc.export_data(session)
 
     @app.post(
@@ -200,7 +245,9 @@ def create_app(
         "nothing. Identity is the task id — never a title guess.",
     )
     async def import_preview(
-        payload: TaskImport, session: SessionDep
+        payload: TaskImport,
+        session: Annotated[AsyncSession, Depends(get_session)],
+        _auth: Annotated[None, Depends(require_api_auth)],
     ) -> dict[str, Any]:
         return await svc.import_preview(session, payload.data)
 
@@ -212,7 +259,11 @@ def create_app(
         "`replace` is an explicit choice and refuses imports whose revision is "
         "older than the existing row. Invalid files write nothing — preview first.",
     )
-    async def import_tasks(payload: TaskImport, session: SessionDep) -> dict[str, Any]:
+    async def import_tasks(
+        payload: TaskImport,
+        session: Annotated[AsyncSession, Depends(get_session)],
+        _auth: Annotated[None, Depends(require_api_auth)],
+    ) -> dict[str, Any]:
         return await svc.import_data(session, payload.data, policy=payload.policy)
 
     @app.exception_handler(ValueError)
@@ -246,14 +297,17 @@ def create_app(
             content["current_task"] = exc.task.model_dump(mode="json")
         return JSONResponse(status_code=code, content=content)
 
+    api_auth = [Depends(require_api_auth)]
+
     # API routes BEFORE the "/" mount: a root mount matches every path,
     # so anything registered after it would be unreachable.
-    app.include_router(events.router, prefix="/api")
-    app.include_router(tasks.router, prefix="/api")
+    app.include_router(events.router, prefix="/api", dependencies=api_auth)
+    app.include_router(tasks.router, prefix="/api", dependencies=api_auth)
     if execution_enabled:
-        app.include_router(tasks.execution_router, prefix="/api")
-    app.include_router(agents.router, prefix="/api")
+        app.include_router(tasks.execution_router, prefix="/api", dependencies=api_auth)
+    app.include_router(agents.router, prefix="/api", dependencies=api_auth)
     app.include_router(web.router)
+    app.include_router(web.auth_router)
     if execution_enabled:
         app.include_router(web.execution_router)
 

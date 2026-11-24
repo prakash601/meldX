@@ -191,6 +191,35 @@ class TaskActivity(SQLModel, table=True):
     changed_fields: list[str] = Field(default_factory=list, sa_column=Column(JSON))
 
 
+class OwnerSession(SQLModel, table=True):
+    """A web login session (product plan §6.5): the cookie carries a raw
+    token; only its hash is stored. Expiring and revocable server-side."""
+
+    __tablename__ = "owner_sessions"
+    __table_args__ = (Index("ix_owner_sessions_expires", "expires_at"),)
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    token_hash: str = Field(unique=True, max_length=64)
+    created_at: datetime = Field(default_factory=_utcnow)
+    expires_at: datetime
+
+
+class Credential(SQLModel, table=True):
+    """A CLI/client bearer credential (product plan §6.5): separately
+    revocable, scoped read/write. The raw token is shown exactly once."""
+
+    __tablename__ = "credentials"
+    __table_args__ = (Index("ix_credentials_revoked", "revoked_at"),)
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    name: str = Field(max_length=100)
+    token_hash: str = Field(unique=True, max_length=64)
+    scopes: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=_utcnow)
+    last_seen_at: datetime | None = None
+    revoked_at: datetime | None = None
+
+
 class IdempotencyKey(SQLModel, table=True):
     """Create-retry safety (ADR-0004): same client/key/payload replays the same
     stored response; same key with a different payload is a conflict."""
