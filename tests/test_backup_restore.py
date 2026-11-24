@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -31,6 +32,28 @@ pytestmark = pytest.mark.skipif(
     ),
     reason="postgres client tools not installed",
 )
+
+
+def _createdb(url: str) -> subprocess.CompletedProcess[str]:
+    """createdb/dropdb take flags, not libpq URIs (unlike psql/pg_dump)."""
+    parsed = urlparse(url)
+    return subprocess.run(
+        ["createdb", "-h", parsed.hostname or "localhost", "-p", str(parsed.port or 5432),
+         "-U", parsed.username or "meldx", parsed.path.lstrip("/")],
+        capture_output=True, text=True, check=False,
+        env={**os.environ, "PGPASSWORD": parsed.password or ""},
+    )
+
+
+def _dropdb(url: str) -> subprocess.CompletedProcess[str]:
+    parsed = urlparse(url)
+    return subprocess.run(
+        ["dropdb", "--if-exists", "-h", parsed.hostname or "localhost",
+         "-p", str(parsed.port or 5432), "-U", parsed.username or "meldx",
+         parsed.path.lstrip("/")],
+        capture_output=True, text=True, check=False,
+        env={**os.environ, "PGPASSWORD": parsed.password or ""},
+    )
 
 
 def _urls(tag: str) -> tuple[str, str]:
@@ -54,7 +77,8 @@ def test_backup_restore_round_trip_preserves_counts(tmp_path: Path) -> None:
         )
 
     try:
-        assert run("createdb", source_url).returncode == 0
+        made = _createdb(source_url)
+        assert made.returncode == 0, made.stderr
         assert (
             run("uv", "run", "alembic", "upgrade", "head", env={"DATABASE_URL": async_url}).returncode
             == 0
@@ -80,7 +104,8 @@ def test_backup_restore_round_trip_preserves_counts(tmp_path: Path) -> None:
         dump_files = sorted((tmp_path).glob("meldx-*.dump"))
         assert len(dump_files) == 1
 
-        assert run("createdb", restore_url).returncode == 0
+        made = _createdb(restore_url)
+        assert made.returncode == 0, made.stderr
         restore = run(
             "sh", str(REPO / "scripts" / "restore.sh"), str(dump_files[0]),
             env={"TARGET_URL": restore_url, "DATABASE_URL": source_url},
@@ -94,5 +119,5 @@ def test_backup_restore_round_trip_preserves_counts(tmp_path: Path) -> None:
             assert restored_count.stdout == source_count.stdout
             assert int(restored_count.stdout) > 0
     finally:
-        run("dropdb", "--if-exists", source_url)
-        run("dropdb", "--if-exists", restore_url)
+        _dropdb(source_url)
+        _dropdb(restore_url)

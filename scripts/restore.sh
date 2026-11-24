@@ -15,7 +15,17 @@ file="${1:?usage: restore.sh <dump-file>}"
 test -f "$file" || { echo "no such dump: $file"; exit 1; }
 
 echo "[$(date -u +%FT%TZ)] restoring $file into TARGET_URL"
-createdb "$TARGET_URL" 2>/dev/null || true
+# createdb/dropdb take flags, not libpq URIs (psql/pg_restore accept both).
+stripped=${TARGET_URL#*://}
+creds_host=${stripped%%/*}
+dbname=${stripped#*/}
+userpass=${creds_host%%@*}
+hostport=${creds_host#*@}
+user=${userpass%%:*}
+pass=${userpass#*:}
+host=${hostport%%:*}
+port=${hostport##*:}
+PGPASSWORD="$pass" createdb -h "$host" -p "$port" -U "$user" "$dbname" 2>/dev/null || true
 pg_restore --clean --if-exists --no-owner --dbname "$TARGET_URL" "$file"
 
 tasks=$(psql "$TARGET_URL" -tAc "SELECT count(*) FROM tasks")
