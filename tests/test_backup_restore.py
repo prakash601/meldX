@@ -37,11 +37,10 @@ def _urls(tag: str) -> tuple[str, str]:
     base = os.environ.get("DATABASE_URL_TEST") or (
         "postgresql+asyncpg://meldx:meldx@localhost:5432/meldx_test"
     )
-    authority = base.split("://", 1)[1].rsplit("@", 1)[1]
-    return (
-        f"postgresql://{authority}/meldx_backup_{tag}",
-        f"postgresql://{authority}/meldx_restore_{tag}",
-    )
+    psql_base = base.replace("postgresql+asyncpg://", "postgresql://")
+    # Swap only the database name so user:password@host:port is preserved.
+    prefix, _, _ = psql_base.rpartition("/")
+    return (f"{prefix}/meldx_backup_{tag}", f"{prefix}/meldx_restore_{tag}")
 
 
 def test_backup_restore_round_trip_preserves_counts(tmp_path: Path) -> None:
