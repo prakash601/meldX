@@ -211,3 +211,76 @@ async def test_sse_recheck_closes_revoked_streams(
         await get_engine().dispose()
         db.reset_engine()
         bus.reset_bus()
+
+
+async def test_token_mint_via_bootstrap_secret(client: AsyncClient) -> None:
+    wrong = await client.post("/api/auth/token", json={"name": "cli", "secret": "nope"})
+    assert wrong.status_code == 401
+    minted = await client.post(
+        "/api/auth/token", json={"name": "cli", "scopes": ["read", "write"], "secret": SECRET}
+    )
+    assert minted.status_code == 200
+    body = minted.json()
+    assert body["scopes"] == ["read", "write"] and body["token"]
+    used = await client.get("/api/tasks", headers={"Authorization": f"Bearer {body['token']}"})
+    assert used.status_code == 200
+    bad_scope = await client.post(
+        "/api/auth/token", json={"name": "x", "scopes": ["admin"], "secret": SECRET}
+    )
+    assert bad_scope.status_code == 400 and "Unknown scopes" in bad_scope.json()["detail"]
+    # minting shares the login limiter, but the earlier success RESET the
+    # failure count — three fresh failures lock it out.
+    for _ in range(3):
+        await client.post("/api/auth/token", json={"name": "x", "secret": "bad"})
+    locked = await client.post(
+        "/api/auth/token", json={"name": "x", "scopes": ["read"], "secret": SECRET}
+    )
+    assert locked.status_code == 429
+
+
+async def test_token_listing_and_revocation_via_session(client: AsyncClient) -> None:
+    await _login(client)
+    minted = await client.post("/api/auth/token", json={"name": "cli", "secret": SECRET})
+    token = minted.json()["token"]
+    listing = await client.get("/api/tokens")
+    assert listing.status_code == 200
+    entries = listing.json()
+    assert [entry["name"] for entry in entries] == ["cli"]
+    assert "token_hash" not in entries[0] and "token" not in entries[0]
+
+    revoked = await client.post(f"/api/tokens/{entries[0]['id']}/revoke")
+    assert revoked.status_code == 200 and revoked.json()["revoked_at"]
+    denied = await client.get("/api/tasks", headers={"Authorization": f"Bearer {token}"})
+    assert denied.status_code == 401
+    missing = await client.post("/api/tokens/00000000-0000-0000-0000-000000000000/revoke")
+    assert missing.status_code == 404
+
+
+async def test_bearer_self_revoke(client: AsyncClient) -> None:
+    minted = await client.post(
+        "/api/auth/token", json={"name": "cli", "scopes": ["read", "write"], "secret": SECRET}
+    )
+    token = minted.json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    assert (await client.get("/api/tasks", headers=headers)).status_code == 200
+    self_revoke = await client.post("/api/auth/revoke", headers=headers)
+    assert self_revoke.status_code == 200 and self_revoke.json() == {"revoked": True, "name": "cli"}
+    assert (await client.get("/api/tasks", headers=headers)).status_code == 401
+
+
+async def test_web_tokens_page_shows_once_and_revokes(client: AsyncClient) -> None:
+    await _login(client)
+    page = await client.get("/tokens")
+    assert page.status_code == 200 and "CLI credentials" in page.text
+    created = await client.post(
+        "/tokens/create",
+        data={"name": "laptop", "read_scope": "true", "write_scope": "true"},
+        headers=_csrf(client),
+    )
+    assert created.status_code == 200
+    assert "shown exactly once" in created.text
+    listing = await client.get("/api/tokens")
+    entry = listing.json()[0]
+    revoked = await client.post(f"/tokens/{entry['id']}/revoke", headers=_csrf(client))
+    assert revoked.status_code == 200 and "revoked" in revoked.text
+

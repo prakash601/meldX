@@ -108,6 +108,15 @@ class TaskImport(SQLModel):
     data: dict[str, Any]
 
 
+class TokenMint(SQLModel):
+    """Owner-only CLI credential issuance (plan §6.5). The bootstrap secret
+    travels in the body, never a URL."""
+
+    name: str = Field(min_length=1, max_length=100)
+    scopes: list[str] = Field(default_factory=lambda: ["read", "write"])
+    secret: str = Field(min_length=1)
+
+
 class TaskClaim(SQLModel):
     agent_id: str = Field(min_length=1)
 

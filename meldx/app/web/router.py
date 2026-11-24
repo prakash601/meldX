@@ -13,13 +13,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from starlette.responses import Response
 
 from meldx.app import auth as authz
 from meldx.app import dates
 from meldx.app.db import get_session
-from meldx.app.models import Priority, Task
+from meldx.app.models import Credential, Priority, Task
 from meldx.app.services import tasks as svc
 
 Session = Annotated[AsyncSession, Depends(get_session)]
@@ -516,6 +517,72 @@ async def complete_task(
 
 def _is_https(request: Request) -> bool:
     return request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+
+
+@router.get(
+    "/tokens",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="CLI credentials page",
+    description="Create, inspect, and revoke CLI bearer credentials. Hashes are "
+    "never shown; a raw token appears exactly once at creation.",
+)
+async def tokens_page(request: Request, session: Session) -> HTMLResponse:
+    rows = list(
+        (await session.exec(select(Credential).order_by(col(Credential.created_at)))).all()
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="tokens.html",
+        context={
+            "credentials": rows,
+            "view": "tokens",
+            "auth_enabled": getattr(request.app.state, "auth", False),
+            "csrf_token": request.cookies.get(authz.CSRF_COOKIE),
+        },
+    )
+
+
+@router.post(
+    "/tokens/create",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Create CLI credential (form)",
+    description="Mints a scoped credential and shows the raw token exactly once.",
+)
+async def tokens_create(
+    request: Request,
+    session: Session,
+    name: Annotated[str, Form(min_length=1, max_length=100)] = "cli",
+    read_scope: Annotated[bool, Form()] = True,
+    write_scope: Annotated[bool, Form()] = True,
+) -> HTMLResponse:
+    scopes = [scope for scope, wanted in (("read", read_scope), ("write", write_scope)) if wanted]
+    raw, row = await authz.create_credential(session, name=name, scopes=scopes or ["read"])
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/token_created.html",
+        context={"token": raw, "credential": row},
+    )
+
+
+@router.post(
+    "/tokens/{credential_id}/revoke",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Revoke CLI credential (form)",
+    description="Immediate revocation; open SSE streams close within one recheck.",
+)
+async def tokens_revoke(request: Request, credential_id: str, session: Session) -> HTMLResponse:
+    await authz.revoke_credential(session, credential_id)
+    rows = list(
+        (await session.exec(select(Credential).order_by(col(Credential.created_at)))).all()
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/tokens_list.html",
+        context={"credentials": rows},
+    )
 
 
 async def _already_logged_in(request: Request, session: Session) -> bool:

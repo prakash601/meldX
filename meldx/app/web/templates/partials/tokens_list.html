@@ -1,0 +1,16 @@
+<div class="space-y-3">
+  {% for credential in credentials %}
+  <div class="rounded-xl border border-slate-800 bg-slate-900 p-4 flex flex-wrap gap-3 items-center justify-between">
+    <div>
+      <p class="font-medium">{{ credential.name }}
+        {% if credential.revoked_at %}<span class="text-xs rounded-full bg-rose-950 text-rose-300 px-2 py-1 ml-2">revoked</span>
+        {% else %}<span class="text-xs rounded-full bg-teal-950 text-teal-300 px-2 py-1 ml-2">active</span>{% endif %}
+      </p>
+      <p class="text-xs text-slate-500 mt-1">scopes: {{ credential.scopes|join(", ") }} · created {{ credential.created_at.strftime("%d %b %Y") }}</p>
+    </div>
+    {% if not credential.revoked_at %}
+    <button hx-post="/tokens/{{ credential.id }}/revoke" hx-target="#token-list" hx-swap="innerHTML" class="text-xs rounded-lg border border-slate-700 px-3 py-2">Revoke</button>
+    {% endif %}
+  </div>
+  {% else %}<p class="rounded-xl border border-dashed border-slate-800 p-6 text-sm text-slate-500">No credentials yet.</p>{% endfor %}
+</div>

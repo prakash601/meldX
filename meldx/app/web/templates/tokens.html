@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="flex items-baseline justify-between max-w-3xl">
+  <h1 class="text-2xl font-semibold">CLI credentials</h1>
+  <a href="/" class="text-teal-400 text-sm">← Back to Today</a>
+</div>
+<p class="text-slate-400 text-sm mt-2 max-w-3xl">
+  Bearer tokens for the CLI and other clients. A raw token is shown exactly once at
+  creation; only its hash is stored. Revocation is immediate.
+</p>
+<form hx-post="/tokens/create" hx-target="#token-result" hx-swap="innerHTML" class="mt-6 flex flex-wrap gap-3 max-w-3xl items-center">
+  <label for="token-name" class="sr-only">Credential name</label>
+  <input id="token-name" name="name" required maxlength="100" value="cli" class="rounded-xl bg-slate-900 border border-slate-700 px-4 py-2">
+  <label class="flex gap-2 items-center text-sm text-slate-400"><input type="checkbox" name="read_scope" value="true" checked> read</label>
+  <label class="flex gap-2 items-center text-sm text-slate-400"><input type="checkbox" name="write_scope" value="true" checked> write</label>
+  <button class="rounded-xl bg-teal-400 text-slate-950 font-semibold px-5 py-2">Create credential</button>
+</form>
+<div id="token-result" class="mt-4"></div>
+<section class="mt-8 max-w-3xl" aria-labelledby="tokens-heading">
+  <h2 id="tokens-heading" class="text-lg font-semibold mb-4">Existing credentials</h2>
+  <div id="token-list">{% include "partials/tokens_list.html" %}</div>
+</section>
+{% endblock %}
