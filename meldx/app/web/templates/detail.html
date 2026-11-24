@@ -2,4 +2,18 @@
 {% block content %}
 <p class="mb-6"><a href="/" class="text-teal-400 text-sm">← Back to Today</a></p>
 {% include "partials/task_detail.html" %}
+{% if activity %}
+<section aria-labelledby="activity-heading" class="mt-10 max-w-2xl">
+  <h2 id="activity-heading" class="text-lg font-semibold mb-4">History</h2>
+  <ol class="space-y-2 text-sm">
+    {% for row in activity %}
+    <li class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 flex flex-wrap gap-x-3 items-baseline">
+      <span class="text-slate-200">{{ row.action }}</span>
+      <span class="text-slate-500 text-xs">by {{ row.actor_type }}{% if row.actor_id %} ({{ row.actor_id }}){% endif %} · {{ row.occurred_at }}</span>
+      {% if row.changed_fields %}<span class="text-slate-600 text-xs">changed: {{ row.changed_fields|join(", ") }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ol>
+</section>
+{% endif %}
 {% endblock %}

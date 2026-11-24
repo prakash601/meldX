@@ -278,6 +278,90 @@ async def test_deadline_editing_and_mutual_exclusion(client: AsyncClient) -> Non
     assert dated.json()["due_date"] == "2026-12-24"
 
 
+async def test_archive_and_restore_via_rest(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "irrelevant now"})).json()["id"]
+    archived = await client.post(f"/api/tasks/{tid}/archive")
+    assert archived.status_code == 200 and archived.json()["archived_at"] is not None
+    # excluded from ordinary lists, present in the archive view
+    assert (await client.get("/api/tasks?view=inbox")).json() == []
+    assert [t["id"] for t in (await client.get("/api/tasks?view=archive")).json()] == [tid]
+    # read-only while archived
+    refused = await client.patch(f"/api/tasks/{tid}", json={"title": "nope"})
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "Task is archived; restore it first"
+    assert (await client.post(f"/api/tasks/{tid}/complete")).status_code == 409
+    restored = await client.post(f"/api/tasks/{tid}/restore")
+    assert restored.json()["archived_at"] is None
+    assert [t["id"] for t in (await client.get("/api/tasks?view=inbox")).json()] == [tid]
+
+
+async def test_web_archive_navigation_and_buttons(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "to archive"})).json()["id"]
+    archive_page = await client.get("/archive")
+    assert archive_page.status_code == 200 and ">Archive<" in archive_page.text
+    archived = await client.post(f"/tasks/{tid}/archive", data={"view": "inbox"})
+    assert "to archive" not in archived.text
+    archive_page = await client.get("/archive")
+    assert "to archive" in archive_page.text and ">Restore<" in archive_page.text
+    restored = await client.post(f"/tasks/{tid}/restore", data={"view": "inbox"})
+    assert "to archive" in restored.text and 'data-group="inbox"' in restored.text
+
+
+async def test_web_search_and_filters_on_open(client: AsyncClient) -> None:
+    await client.post("/api/tasks", json={"title": "findable report", "priority": "high"})
+    await client.post("/api/tasks", json={"title": "other report"})
+    page = await client.get("/open")
+    assert page.status_code == 200 and 'id="q"' in page.text  # the filter form
+    filtered = await client.get("/open?q=findable&priority=high")
+    assert "findable report" in filtered.text and "other report" not in filtered.text
+    fragment = await client.get("/partials/tasks?view=open&q=findable&priority=high")
+    assert "findable report" in fragment.text and "<html" not in fragment.text
+
+
+async def test_activity_endpoint_and_detail_timeline(client: AsyncClient) -> None:
+    tid = (await client.post("/api/tasks", json={"title": "history task"})).json()["id"]
+    await client.post(f"/api/tasks/{tid}/start")
+    await client.post(f"/api/tasks/{tid}/complete")
+    history = await client.get(f"/api/tasks/{tid}/activity")
+    assert history.status_code == 200
+    assert [row["action"] for row in history.json()["activity"]] == [
+        "created",
+        "started",
+        "completed",
+    ]
+    assert all("title" not in row and "description" not in row for row in history.json()["activity"])
+    missing = await client.get("/api/tasks/00000000-0000-0000-0000-000000000000/activity")
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "Task locked or not found"
+    detail = await client.get(f"/tasks/{tid}")
+    assert detail.status_code == 200
+    assert 'id="activity-heading"' in detail.text and ">completed<" in detail.text
+
+
+async def test_export_import_via_rest(client: AsyncClient) -> None:
+    created = (await client.post("/api/tasks", json={"title": "portable work"})).json()
+    exported = await client.get("/api/export")
+    assert exported.status_code == 200
+    document = exported.json()
+    assert document["schema_version"] == 1
+    assert [t["id"] for t in document["tasks"]] == [created["id"]]
+
+    preview = await client.post("/api/import/preview", json={"policy": "skip", "data": document})
+    assert preview.status_code == 200 and preview.json()["valid"] is True
+    assert preview.json()["counts"]["duplicates"] == 1  # the task already exists
+
+    applied = await client.post("/api/import", json={"policy": "skip", "data": document})
+    assert applied.status_code == 200
+    assert applied.json() == {"policy": "skip", "created": 0, "replaced": 0, "skipped": 1}
+
+    bad = await client.post("/api/import", json={"policy": "nope", "data": document})
+    assert bad.status_code == 400 and "policy must be" in bad.json()["detail"]
+    invalid = await client.post(
+        "/api/import", json={"policy": "skip", "data": {"schema_version": 99, "tasks": []}}
+    )
+    assert invalid.status_code == 400 and "Unsupported export schema version" in invalid.json()["detail"]
+
+
 async def test_today_groups_actions_and_escaping(client: AsyncClient) -> None:
     first = (await client.post("/api/tasks", json={"title": "<script>alert(1)</script>"})).json()
     delegated = (

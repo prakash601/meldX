@@ -7,6 +7,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from meldx.app.db import get_session
 from meldx.app.models import (
+    Priority,
     Task,
     TaskClaim,
     TaskCreate,
@@ -43,17 +44,22 @@ CLIENT_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 @router.get(
     "",
     summary="List tasks",
-    description="Stable order (oldest first). `status` filters by exact status and "
-    "`today_only` keeps the LEGACY UTC-date semantics for existing consumers. "
-    "For the owner-local view semantics use `view`: `inbox`, `today`, `upcoming`, "
-    "`open`, `overdue`, `missed`, or `completed` (with `completed_days` window, "
-    "default today). `view` takes precedence over `status`/`today_only`. Bounded: "
-    "`limit` default 50, max 200, with `offset` paging.",
+    description="Stable order (oldest first), bounded: `limit` default 50, max 200, "
+    "with `offset` paging. `status` filters by exact status and `today_only` "
+    "keeps the LEGACY UTC-date semantics. `q` searches title/description "
+    "case-insensitively (wildcards are escaped; never a raw pattern), "
+    "`priority` narrows by priority, and archived rows are excluded — use "
+    "`view=archive` for those. For owner-local view semantics use `view`: "
+    "`inbox`, `today`, `upcoming`, `open`, `overdue`, `missed`, `completed` "
+    "(with `completed_days` window), or `archive`; `view` takes precedence "
+    "over `status`/`today_only`.",
 )
 async def list_tasks(
     session: Session,
     status: TaskStatus | None = None,
     today_only: bool = False,
+    q: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    priority: Priority | None = None,
     view: str | None = None,
     completed_days: Annotated[int, Query(ge=1, le=366)] = 1,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -61,10 +67,21 @@ async def list_tasks(
 ) -> list[Task]:
     if view is not None:
         return await svc.view_tasks(
-            session, view=view, completed_days=completed_days, limit=limit
+            session,
+            view=view,
+            completed_days=completed_days,
+            q=q,
+            priority=priority.value if priority is not None else None,
+            limit=limit,
         )
     return await svc.list_tasks(
-        session, status=status, today_only=today_only, limit=limit, offset=offset
+        session,
+        status=status,
+        today_only=today_only,
+        q=q,
+        priority=priority.value if priority is not None else None,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -121,6 +138,24 @@ async def start_task(task_id: str, session: Session) -> Task:
     return await svc.start_task(session, task_id=task_id)
 
 
+@router.get(
+    "/{task_id}/activity",
+    summary="Task history",
+    description="Durable activity timeline for one task: create/edit/start/"
+    "complete/reopen/plan/snooze/archive events with actor and changed-field "
+    "names — no titles, descriptions, or credentials. Stable order with "
+    "`limit`/`offset` paging.",
+    responses={404: {"description": "No task with that id. `detail` is `Task locked or not found`."}},
+)
+async def get_activity(
+    task_id: str,
+    session: Session,
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    return await svc.task_activity(session, task_id=task_id, limit=limit, offset=offset)
+
+
 @router.post(
     "/{task_id}/plan",
     summary="Plan a task",
@@ -143,6 +178,31 @@ async def plan_task(task_id: str, payload: TaskPlan, session: Session) -> Task:
 )
 async def unsnooze_task(task_id: str, session: Session) -> Task:
     return await svc.unsnooze_task(session, task_id=task_id)
+
+
+@router.post(
+    "/{task_id}/archive",
+    summary="Archive a task",
+    description="Removes the task from ordinary views without deleting anything; "
+    "lifecycle, scheduling, and completion metadata are preserved. Archived "
+    "rows are read-only until restored (409 `Task is archived; restore it "
+    "first`). Idempotent.",
+    responses=CLIENT_ERROR_RESPONSES,
+)
+async def archive_task(task_id: str, session: Session) -> Task:
+    return await svc.archive_task(session, task_id=task_id)
+
+
+@router.post(
+    "/{task_id}/restore",
+    summary="Restore an archived task",
+    description="Returns an archived task to ordinary views with its dates "
+    "untouched — a restored overdue task shows as overdue, nothing is "
+    "silently replanned. Idempotent for tasks that were never archived.",
+    responses=CLIENT_ERROR_RESPONSES,
+)
+async def restore_task(task_id: str, session: Session) -> Task:
+    return await svc.restore_task(session, task_id=task_id)
 
 
 @router.post(

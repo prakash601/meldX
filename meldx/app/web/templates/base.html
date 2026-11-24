@@ -18,7 +18,7 @@
     </header>
     {% if view is defined %}
     <nav aria-label="Board views" class="flex gap-5 mb-8 text-sm border-b border-slate-800 pb-3">
-      {% set nav_items = [("today", "/", "Today"), ("inbox", "/inbox", "Inbox"), ("upcoming", "/upcoming", "Upcoming"), ("open", "/open", "All open"), ("completed", "/completed", "Completed")] %}
+      {% set nav_items = [("today", "/", "Today"), ("inbox", "/inbox", "Inbox"), ("upcoming", "/upcoming", "Upcoming"), ("open", "/open", "All open"), ("completed", "/completed", "Completed"), ("archive", "/archive", "Archive")] %}
       {% for key, href, label in nav_items %}
       <a href="{{ href }}" class="{% if view == key %}text-teal-300 border-b-2 border-teal-300 pb-1{% else %}text-slate-400 hover:text-slate-200{% endif %}">{{ label }}</a>
       {% endfor %}

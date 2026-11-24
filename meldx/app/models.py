@@ -101,6 +101,13 @@ class TaskPlan(SQLModel):
     date: str | None = Field(default=None, min_length=1)
 
 
+class TaskImport(SQLModel):
+    """Apply or preview an import (plan F10). `data` is an export document."""
+
+    policy: str = Field(default="skip")  # skip | replace
+    data: dict[str, Any]
+
+
 class TaskClaim(SQLModel):
     agent_id: str = Field(min_length=1)
 
@@ -130,6 +137,7 @@ class Task(TaskFields, table=True):
         Index("ix_tasks_due_date", "due_date"),
         Index("ix_tasks_snoozed_until", "snoozed_until"),
         Index("ix_tasks_completed_at", "completed_at"),
+        Index("ix_tasks_archived_at", "archived_at"),
         # A deadline is a date-only value OR an exact instant, never both
         # (product plan §4.2: never silently invent a time for a date).
         CheckConstraint(
@@ -152,6 +160,9 @@ class Task(TaskFields, table=True):
     planned_date: date | None = Field(default=None, sa_column=Column(Date))
     due_date: date | None = Field(default=None, sa_column=Column(Date))
     snoozed_until: datetime | None = Field(default=None)
+    # v0.0.3 reversible archive (ADR-004): ordinary views exclude archived
+    # rows; restore returns them with all metadata intact.
+    archived_at: datetime | None = Field(default=None)
     agent_id: str | None = Field(default=None, foreign_key="agents.id")
     lease_expires_at: datetime | None = Field(default=None)
     due_at: datetime | None = None

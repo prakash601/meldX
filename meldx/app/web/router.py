@@ -27,7 +27,7 @@ execution_router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 Session = Annotated[AsyncSession, Depends(get_session)]
 
-NAV_VIEWS = ("today", "inbox", "upcoming", "open", "completed")
+NAV_VIEWS = ("today", "inbox", "upcoming", "open", "completed", "archive")
 
 
 def _aware_utc(dt: datetime | None) -> datetime | None:
@@ -57,15 +57,21 @@ async def board(
     *,
     view: str = "today",
     completed_days: int = 1,
+    q: str | None = None,
+    priority: str | None = None,
 ) -> HTMLResponse:
     if view not in NAV_VIEWS:
         view = "today"
+
+    async def fetch(view_name: str) -> list[Task]:
+        return await svc.view_tasks(
+            session, view=view_name, completed_days=completed_days, q=q, priority=priority
+        )
+
     sections: list[tuple[str, list[Task], str]] = []
     if view == "today":
         summary = await svc.today_summary(session)
-        in_progress = [
-            t for t in await svc.view_tasks(session, view="open") if t.progress.value == "doing"
-        ]
+        in_progress = [t for t in await fetch("open") if t.progress.value == "doing"]
         sections = [
             ("In progress", in_progress, "in-progress"),
             ("Today", list(summary["today"]), "today"),
@@ -73,14 +79,14 @@ async def board(
             ("Missed plans", list(summary["missed_plans"]), "missed"),
         ]
     elif view == "completed":
-        completed = await svc.view_tasks(
-            session, view="completed", completed_days=completed_days
-        )
+        completed = await fetch("completed")
         label = "Completed today" if completed_days == 1 else f"Completed (last {completed_days} days)"
         sections = [(label, completed, "completed")]
+    elif view == "archive":
+        sections = [("Archive", await fetch("archive"), "archive")]
     else:
         labels = {"inbox": "Inbox", "upcoming": "Upcoming", "open": "All open"}
-        sections = [(labels[view], await svc.view_tasks(session, view=view), view)]
+        sections = [(labels[view], await fetch(view), view)]
 
     shown = [t for _, tasks, _ in sections for t in tasks]
     snoozed_ids, overdue_ids = _flag_ids(shown)
@@ -92,6 +98,8 @@ async def board(
             "sections": sections,
             "today": dates.today_date(),
             "completed_days": completed_days,
+            "q": q,
+            "priority": priority,
             "snoozed_ids": snoozed_ids,
             "overdue_ids": overdue_ids,
             "agent_execution": getattr(request.app.state, "agent_execution", False),
@@ -138,10 +146,23 @@ async def upcoming(request: Request, session: Session) -> HTMLResponse:
     response_class=HTMLResponse,
     tags=["web"],
     summary="All open board",
-    description="Every open task, including actively snoozed ones (badged).",
+    description="Every open task, including actively snoozed ones (badged). "
+    "Search text and priority filters combine with the view (F08).",
 )
-async def all_open(request: Request, session: Session) -> HTMLResponse:
-    return await board(request, session, "board.html", view="open")
+async def all_open(
+    request: Request,
+    session: Session,
+    q: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    priority: Annotated[Priority | None, Query()] = None,
+) -> HTMLResponse:
+    return await board(
+        request,
+        session,
+        "board.html",
+        view="open",
+        q=q,
+        priority=priority.value if priority is not None else None,
+    )
 
 
 @router.get(
@@ -163,21 +184,53 @@ async def completed(
 
 
 @router.get(
+    "/archive",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Archive board",
+    description="Archived tasks with Restore. Nothing is deleted; metadata is "
+    "preserved. Search and priority filters apply.",
+)
+async def archive(
+    request: Request,
+    session: Session,
+    q: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    priority: Annotated[Priority | None, Query()] = None,
+) -> HTMLResponse:
+    return await board(
+        request,
+        session,
+        "board.html",
+        view="archive",
+        q=q,
+        priority=priority.value if priority is not None else None,
+    )
+
+
+@router.get(
     "/partials/tasks",
     response_class=HTMLResponse,
     tags=["web"],
     summary="Board fragment",
     description="HTML fragment for the requested view. Used by HTMX on load, "
-    "refresh, SSE events, and day rollover.",
+    "refresh, SSE events, day rollover, and the search/filter form.",
 )
 async def task_board(
     request: Request,
     session: Session,
     view: str = "today",
     days: Annotated[int, Query(ge=1, le=366)] = 1,
+    q: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    priority: Annotated[Priority | None, Query()] = None,
 ) -> HTMLResponse:
     return await board(
-        request, session, "partials/board.html", view=view, completed_days=days
+        request,
+        session,
+        "partials/board.html",
+        view=view,
+        completed_days=days,
+        q=q,
+        priority=priority.value if priority is not None else None,
     )
 
 
@@ -293,11 +346,13 @@ async def task_detail(request: Request, task_id: str, session: Session) -> HTMLR
         return templates.TemplateResponse(
             request=request, name="missing.html", status_code=404, context={}
         )
+    history = await svc.task_activity(session, task_id=task_id, limit=50)
     return templates.TemplateResponse(
         request=request,
         name="detail.html",
         context={
             "task": task,
+            "activity": history["activity"],
             "view": "detail",
             "agent_execution": getattr(request.app.state, "agent_execution", False),
         },
@@ -381,6 +436,34 @@ async def claim_task(
 ) -> HTMLResponse:
     request.state.agent_id = agent_id
     await svc.claim_task(session, task_id=task_id, agent_id=agent_id)
+    return await board(request, session, "partials/board.html", view=view)
+
+
+@router.post(
+    "/tasks/{task_id}/archive",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Archive task (form)",
+    description="Hides the task from ordinary views; read-only until restored.",
+)
+async def archive_task(
+    request: Request, task_id: str, session: Session, view: Annotated[str, Form()] = "today"
+) -> HTMLResponse:
+    await svc.archive_task(session, task_id=task_id)
+    return await board(request, session, "partials/board.html", view=view)
+
+
+@router.post(
+    "/tasks/{task_id}/restore",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Restore task (form)",
+    description="Returns an archived task to ordinary views, dates untouched.",
+)
+async def restore_task(
+    request: Request, task_id: str, session: Session, view: Annotated[str, Form()] = "today"
+) -> HTMLResponse:
+    await svc.restore_task(session, task_id=task_id)
     return await board(request, session, "partials/board.html", view=view)
 
 

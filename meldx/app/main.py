@@ -6,17 +6,19 @@ import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from meldx.app import bus, dates
 from meldx.app.api import agents, events, tasks
-from meldx.app.db import check_db, ensure_schema, get_engine, is_sqlite
+from meldx.app.db import check_db, ensure_schema, get_engine, get_session, is_sqlite
 from meldx.app.mcp.tools import mcp as mcp_server
+from meldx.app.models import TaskImport
 from meldx.app.services import tasks as svc
 from meldx.app.web import router as web
 
@@ -175,6 +177,43 @@ def create_app(
                 "agent_execution": execution_enabled,
             },
         }
+
+    SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+    @app.get(
+        "/api/export",
+        tags=["tasks"],
+        summary="Export all tasks with history",
+        description="Schema-versioned JSON snapshot for data portability (plan F10): "
+        "every task — archived included — with stable IDs, scheduling fields, and "
+        "the durable activity history. No credentials exist in task data.",
+    )
+    async def export_tasks(session: SessionDep) -> dict[str, Any]:
+        return await svc.export_data(session)
+
+    @app.post(
+        "/api/import/preview",
+        tags=["tasks"],
+        summary="Preview an import",
+        description="Validates an export document against the database and reports "
+        "counts, invalid rows, duplicates, and missing parent references. Writes "
+        "nothing. Identity is the task id — never a title guess.",
+    )
+    async def import_preview(
+        payload: TaskImport, session: SessionDep
+    ) -> dict[str, Any]:
+        return await svc.import_preview(session, payload.data)
+
+    @app.post(
+        "/api/import",
+        tags=["tasks"],
+        summary="Apply an import",
+        description="Transactional import: the default duplicate policy is `skip`; "
+        "`replace` is an explicit choice and refuses imports whose revision is "
+        "older than the existing row. Invalid files write nothing — preview first.",
+    )
+    async def import_tasks(payload: TaskImport, session: SessionDep) -> dict[str, Any]:
+        return await svc.import_data(session, payload.data, policy=payload.policy)
 
     @app.exception_handler(ValueError)
     async def task_error(request: Request, exc: ValueError) -> JSONResponse:

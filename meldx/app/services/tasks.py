@@ -167,6 +167,12 @@ def _guard_not_done(task: Task) -> None:
         raise TaskStateConflict("Task is done; reopen it first")
 
 
+def _guard_not_archived(task: Task) -> None:
+    """Archived rows are read-only until restored (plan §4.3, F09.2)."""
+    if task.archived_at is not None:
+        raise TaskStateConflict("Task is archived; restore it first")
+
+
 def _request_hash(**fields: Any) -> str:
     blob = json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(blob.encode()).hexdigest()
@@ -296,13 +302,34 @@ async def list_tasks(
     *,
     status: str | None = None,
     today_only: bool = False,
+    q: str | None = None,
+    priority: str | None = None,
+    include_archived: bool = False,
     limit: int | None = 50,
     offset: int = 0,
 ) -> list[Task]:
-    """Stable order (created_at, id) with bounded pagination; None = unbounded."""
+    """Stable order (created_at, id) with bounded pagination; None = unbounded.
+
+    `q` searches title/description case-insensitively with SQL wildcards
+    escaped — user input is never a pattern. Archived rows are excluded
+    unless explicitly requested (the archive view is the only ordinary
+    consumer that asks for them).
+    """
     stmt = select(Task).order_by(col(Task.created_at), col(Task.id))
+    if not include_archived:
+        stmt = stmt.where(col(Task.archived_at).is_(None))
     if status is not None:
         stmt = stmt.where(col(Task.status) == TaskStatus(status))
+    if priority is not None:
+        stmt = stmt.where(col(Task.priority) == Priority(priority))
+    if q:
+        needle = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        stmt = stmt.where(
+            or_(
+                col(Task.title).ilike(f"%{needle}%", escape="\\"),
+                col(Task.description).ilike(f"%{needle}%", escape="\\"),
+            )
+        )
     tasks = list((await session.exec(stmt)).all())
     if today_only:
         today = _now().date()
@@ -318,6 +345,14 @@ async def list_tasks(
     if limit is not None:
         tasks = tasks[:limit]
     return tasks
+
+
+def _matches_q(task: Task, q: str) -> bool:
+    """In-memory twin of the SQL search for the view paths (personal scale)."""
+    needle = q.casefold()
+    return needle in (task.title or "").casefold() or needle in (
+        task.description or ""
+    ).casefold()
 
 
 async def claim_task(session: AsyncSession, *, task_id: str, agent_id: str) -> Task:
@@ -355,6 +390,7 @@ async def _claim_skip_locked(
             raise TaskNotFound(LOCKED_MSG)
         raise TaskLocked(LOCKED_MSG)
     _guard_not_done(task)
+    _guard_not_archived(task)
     _guard_lease(task, agent_id, now)
     task.progress = TaskProgress.doing
     task.agent_id = agent_id
@@ -383,6 +419,7 @@ async def _claim_atomic(
     stmt = (
         update(Task)
         .where(col(Task.id) == tid)
+        .where(col(Task.archived_at).is_(None))
         .where(col(Task.lifecycle) != TaskLifecycle.done)
         .where(
             or_(
@@ -406,6 +443,7 @@ async def _claim_atomic(
         task = await session.get(Task, tid)
         if task is None:
             raise TaskNotFound(LOCKED_MSG)
+        _guard_not_archived(task)
         _guard_not_done(task)
         _guard_lease(task, agent_id, now)
         raise TaskLocked(LOCKED_MSG)
@@ -436,6 +474,7 @@ async def complete_task(session: AsyncSession, *, task_id: str) -> Task:
     """Idempotent completion: a repeated request keeps the original timestamp
     and records no duplicate activity or event."""
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     if task.lifecycle is TaskLifecycle.done:
         return task
     now = _now()
@@ -460,6 +499,7 @@ async def reopen_task(session: AsyncSession, *, task_id: str) -> Task:
     and planning markers are reintroduced as data in v0.0.2 (ADR-004).
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     if task.lifecycle is TaskLifecycle.open:
         return task
     task.lifecycle = TaskLifecycle.open
@@ -478,6 +518,7 @@ async def reopen_task(session: AsyncSession, *, task_id: str) -> Task:
 async def start_task(session: AsyncSession, *, task_id: str) -> Task:
     """Personal doing: no agent identity, no lease. Idempotent."""
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     _guard_not_done(task)
     if task.progress is TaskProgress.doing:
         return task
@@ -514,6 +555,7 @@ async def update_task(
     409 carrying the current task so the client can reload.
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     if expected_revision is not None and expected_revision != task.revision:
         raise StaleRevision(task)
     if title is not None:
@@ -559,6 +601,7 @@ async def handoff_task(
     session: AsyncSession, *, task_id: str, to_agent: str, note: str | None = None
 ) -> Task:
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     await ensure_agent(session, to_agent)
     task.agent_id = to_agent
     task.status = TaskStatus.today
@@ -588,6 +631,7 @@ async def snooze_task(session: AsyncSession, *, task_id: str, until: str) -> Tas
     the past is rejected.
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     instant = dates.parse_instant(until)
     if instant <= _now():
         raise ValueError(f"Cannot snooze into the past: {until!r}")
@@ -617,6 +661,7 @@ async def plan_task(session: AsyncSession, *, task_id: str, date: str | None) ->
     none) reads as `inbox`.
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     planned = parse_due_date(date)
     task.planned_date = planned
     if task.lifecycle is TaskLifecycle.open and task.progress is TaskProgress.ready:
@@ -640,6 +685,7 @@ async def unsnooze_task(session: AsyncSession, *, task_id: str) -> Task:
     `inbox`; the owner replans rather than the service guessing (plan §4.3).
     """
     task = await _get_or_locked(session, _coerce_id(task_id))
+    _guard_not_archived(task)
     if task.snoozed_until is None:
         return task
     task.snoozed_until = None
@@ -657,7 +703,59 @@ async def unsnooze_task(session: AsyncSession, *, task_id: str) -> Task:
     return task
 
 
-VIEW_NAMES = ("today", "inbox", "upcoming", "open", "overdue", "missed", "completed")
+async def archive_task(session: AsyncSession, *, task_id: str) -> Task:
+    """Reversible removal from ordinary views (plan §4.3, F09).
+
+    Lifecycle, scheduling, and completion metadata are all preserved; an
+    archived row is read-only until restored. Idempotent.
+    """
+    task = await _get_or_locked(session, _coerce_id(task_id))
+    if task.archived_at is not None:
+        return task
+    task.archived_at = _now()
+    _touch(task)
+    session.add(task)
+    session.add(_record(task.id, action="archived"))
+    await session.commit()
+    await session.refresh(task)
+    bus.publish("task.updated", task)
+    return task
+
+
+async def restore_task(session: AsyncSession, *, task_id: str) -> Task:
+    """Return an archived task to ordinary views, dates untouched (F09.3).
+
+    A restored overdue task shows as overdue; nothing is silently replanned.
+    Idempotent for tasks that were never archived.
+    """
+    task = await _get_or_locked(session, _coerce_id(task_id))
+    if task.archived_at is None:
+        return task
+    task.archived_at = None
+    _touch(task)
+    session.add(task)
+    session.add(_record(task.id, action="restored"))
+    await session.commit()
+    await session.refresh(task)
+    bus.publish("task.updated", task)
+    return task
+
+
+VIEW_NAMES = (
+    "today",
+    "inbox",
+    "upcoming",
+    "open",
+    "overdue",
+    "missed",
+    "completed",
+    "archive",
+)
+
+
+def _is_live(task: Task) -> bool:
+    """Ordinary views never show archived rows (plan §4.3)."""
+    return task.archived_at is None
 
 
 def _snoozed_active(task: Task, now: datetime) -> bool:
@@ -680,9 +778,9 @@ def _legacy_today_marker(task: Task) -> bool:
 
 
 def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> list[Task]:
-    """View membership per product plan §4.3. All views are open-lifecycle
-    unless stated. Snoozed tasks stay hidden until their instant passes —
-    expiry is derived at query time, no scheduler needed."""
+    """View membership per product plan §4.3. Ordinary views exclude archived
+    rows. Snoozed tasks stay hidden until their instant passes — expiry is
+    derived at query time, no scheduler needed."""
     now = _now()
     today = dates.today_date()
     _, day_end = dates.local_day_bounds(today)
@@ -695,7 +793,8 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
         return [
             t
             for t in tasks
-            if t.lifecycle is TaskLifecycle.open
+            if _is_live(t)
+            and t.lifecycle is TaskLifecycle.open
             and t.progress is TaskProgress.ready
             and not _snoozed_active(t, now)
             and not _legacy_today_marker(t)
@@ -707,7 +806,8 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
         return [
             t
             for t in tasks
-            if t.lifecycle is TaskLifecycle.open
+            if _is_live(t)
+            and t.lifecycle is TaskLifecycle.open
             and not _snoozed_active(t, now)
             and (_planned_today(t, today) or _due_today(t, today) or _legacy_today_marker(t))
         ]
@@ -716,13 +816,16 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
         return [
             t
             for t in tasks
-            if t.lifecycle is TaskLifecycle.open and dates.is_overdue(_aware(t.due_at), t.due_date)
+            if _is_live(t)
+            and t.lifecycle is TaskLifecycle.open
+            and dates.is_overdue(_aware(t.due_at), t.due_date)
         ]
     if view == "missed":
         return [
             t
             for t in tasks
-            if t.lifecycle is TaskLifecycle.open
+            if _is_live(t)
+            and t.lifecycle is TaskLifecycle.open
             and t.planned_date is not None
             and t.planned_date < today
         ]
@@ -730,7 +833,8 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
         return [
             t
             for t in tasks
-            if t.lifecycle is TaskLifecycle.open
+            if _is_live(t)
+            and t.lifecycle is TaskLifecycle.open
             and (
                 (t.planned_date is not None and t.planned_date > today)
                 or (t.due_date is not None and t.due_date > today)
@@ -738,7 +842,7 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
             )
         ]
     if view == "open":
-        return [t for t in tasks if t.lifecycle is TaskLifecycle.open]
+        return [t for t in tasks if _is_live(t) and t.lifecycle is TaskLifecycle.open]
     if view == "completed":
         start = dates.local_day_bounds(today - timedelta(days=max(completed_days, 1) - 1))[0]
 
@@ -746,23 +850,75 @@ def _view_filter(view: str, tasks: list[Task], *, completed_days: int = 1) -> li
             completed = _aware(task.completed_at)
             return completed is not None and start <= completed
 
-        return [t for t in tasks if t.lifecycle is TaskLifecycle.done and completed_in_range(t)]
+        return [
+            t
+            for t in tasks
+            if _is_live(t) and t.lifecycle is TaskLifecycle.done and completed_in_range(t)
+        ]
+    if view == "archive":
+        return [t for t in tasks if t.archived_at is not None]
     raise ValueError(f"Unknown view: {view!r}")
 
 
 async def view_tasks(
-    session: AsyncSession, *, view: str, completed_days: int = 1, limit: int | None = 200
+    session: AsyncSession,
+    *,
+    view: str,
+    completed_days: int = 1,
+    q: str | None = None,
+    priority: str | None = None,
+    limit: int | None = 200,
 ) -> list[Task]:
-    """Explicit view queries with the §4.3 membership rules. Bounded scan of
-    the personal list; the legacy `status`/`today_only` filters keep their old
-    UTC semantics for existing consumers (ADR-004 compatibility #7)."""
+    """Explicit view queries with the §4.3 membership rules, optionally
+    narrowed by search text and priority. Bounded scan of the personal list;
+    the legacy `status`/`today_only` filters keep their old UTC semantics for
+    existing consumers (ADR-004 compatibility #7)."""
     if view not in VIEW_NAMES:
         raise ValueError(f"Unknown view: {view!r}")
-    tasks = await list_tasks(session, limit=1000)
+    tasks = await list_tasks(session, limit=1000, include_archived=True)
+    if q:
+        tasks = [t for t in tasks if _matches_q(t, q)]
+    if priority is not None:
+        wanted = Priority(priority)
+        tasks = [t for t in tasks if t.priority is wanted]
     filtered = _view_filter(view, tasks, completed_days=completed_days)
     if limit is not None:
         filtered = filtered[:limit]
     return filtered
+
+
+async def task_activity(
+    session: AsyncSession, *, task_id: str, limit: int = 100, offset: int = 0
+) -> dict[str, Any]:
+    """Durable history for one task (v0.0.3 exposure of the v0.0.1
+    foundation). Stable order; missing ids keep the contract message."""
+    tid = _coerce_id(task_id)
+    await _get_or_locked(session, tid)  # 404 for unknown tasks, not empty list
+    stmt = (
+        select(TaskActivity)
+        .where(col(TaskActivity.task_id) == tid)
+        .order_by(col(TaskActivity.occurred_at), col(TaskActivity.id))
+    )
+    rows = list((await session.exec(stmt)).all())
+    if offset:
+        rows = rows[offset:]
+    if limit is not None:
+        rows = rows[:limit]
+    return {
+        "task_id": str(tid),
+        "activity": [
+            {
+                "id": str(row.id),
+                "action": row.action,
+                "actor_type": row.actor_type.value,
+                "actor_id": row.actor_id,
+                "occurred_at": row.occurred_at.isoformat() if row.occurred_at else None,
+                "request_id": row.request_id,
+                "changed_fields": row.changed_fields,
+            }
+            for row in rows
+        ],
+    }
 
 
 async def today_summary(session: AsyncSession) -> dict[str, Any]:
@@ -779,3 +935,220 @@ async def today_summary(session: AsyncSession) -> dict[str, Any]:
         "missed_plans": _view_filter("missed", tasks),
         "completed_today": _view_filter("completed", tasks),
     }
+
+
+EXPORT_SCHEMA_VERSION = 1
+
+# Fields a `replace`-policy import overwrites on an existing row. Identity
+# (id), history, and the audit trail columns stay managed by the service.
+_REPLACE_FIELDS = (
+    "title",
+    "description",
+    "priority",
+    "status",
+    "lifecycle",
+    "progress",
+    "revision",
+    "planned_date",
+    "due_date",
+    "due_at",
+    "snoozed_until",
+    "archived_at",
+    "agent_id",
+    "lease_expires_at",
+    "parent_id",
+    "created_at",
+    "updated_at",
+    "completed_at",
+)
+
+
+def _task_from_import(row: dict[str, Any]) -> Task:
+    payload = {key: value for key, value in row.items() if key != "activity"}
+    return Task.model_validate(payload)
+
+
+def _activity_from_import(row: dict[str, Any], task_id: UUID) -> TaskActivity:
+    payload = dict(row)
+    payload["task_id"] = task_id
+    payload["actor_type"] = ActorType(payload.get("actor_type", ActorType.owner.value))
+    return TaskActivity.model_validate(payload)
+
+
+async def export_data(session: AsyncSession) -> dict[str, Any]:
+    """Full data portability snapshot (plan F10.1): every task — archived
+    included — with its durable history and stable IDs. No credentials exist
+    in task data; agent identity is a plain id."""
+    tasks = await list_tasks(session, limit=1000, include_archived=True)
+    exported: list[dict[str, Any]] = []
+    for task in tasks:
+        history = await task_activity(session, task_id=str(task.id), limit=1000)
+        dump = task.model_dump(mode="json")
+        dump["activity"] = history["activity"]
+        exported.append(dump)
+    return {
+        "schema_version": EXPORT_SCHEMA_VERSION,
+        "exported_at": _now().isoformat(),
+        "tasks": exported,
+    }
+
+
+async def _analyze_import(
+    session: AsyncSession, data: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate an import payload against the database WITHOUT writing.
+
+    Identity is only ever the task id — never a title guess (plan F10.3).
+    """
+    version = data.get("schema_version")
+    if version != EXPORT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported export schema version: {version!r}; expected {EXPORT_SCHEMA_VERSION}"
+        )
+    rows = data.get("tasks")
+    if not isinstance(rows, list):
+        # ValueError on purpose: the 400 contract reports payload-shape
+        # problems to the client like every other import error.
+        raise ValueError("Import payload has no tasks list")  # noqa: TRY004
+
+    prepared: list[tuple[Task, list[TaskActivity]]] = []
+    invalid_rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            invalid_rows.append({"index": index, "reason": "task entry is not an object"})
+            continue
+        try:
+            task = _task_from_import(row)
+            if not (task.title or "").strip():
+                raise ValueError("title is empty")
+            activity = [
+                _activity_from_import(entry, task.id)
+                for entry in row.get("activity", [])
+                if isinstance(entry, dict)
+            ]
+        except Exception as exc:  # noqa: BLE001 - reported per row, not raised
+            invalid_rows.append({"index": index, "reason": str(exc)})
+            continue
+        if str(task.id) in seen_ids:
+            invalid_rows.append(
+                {"index": index, "task_id": str(task.id), "reason": "duplicate id inside the file"}
+            )
+            continue
+        seen_ids.add(str(task.id))
+        prepared.append((task, activity))
+
+    new_entries: list[tuple[Task, list[TaskActivity]]] = []
+    duplicate_entries: list[tuple[Task, list[TaskActivity], Task]] = []
+    for task, activity in prepared:
+        existing = await session.get(Task, task.id)
+        if existing is None:
+            new_entries.append((task, activity))
+        else:
+            duplicate_entries.append((task, activity, existing))
+
+    missing_parents: list[dict[str, str]] = []
+    for task, _ in prepared:
+        if task.parent_id is None or str(task.parent_id) in seen_ids:
+            continue
+        found = await session.get(Task, task.parent_id)
+        if found is None:
+            missing_parents.append(
+                {"task_id": str(task.id), "parent_id": str(task.parent_id)}
+            )
+
+    return {
+        "valid": not invalid_rows and not missing_parents,
+        "schema_version": EXPORT_SCHEMA_VERSION,
+        "counts": {
+            "tasks_in_file": len(rows),
+            "new": len(new_entries),
+            "duplicates": len(duplicate_entries),
+            "invalid": len(invalid_rows),
+            "missing_parents": len(missing_parents),
+            "activity_rows": sum(len(activity) for _, activity in prepared),
+        },
+        "invalid_rows": invalid_rows,
+        "missing_parents": missing_parents,
+        "duplicates": [
+            {
+                "task_id": str(task.id),
+                "existing_revision": existing.revision,
+                "incoming_revision": task.revision,
+            }
+            for task, _, existing in duplicate_entries
+        ],
+        "_new": new_entries,
+        "_duplicates": duplicate_entries,
+    }
+
+
+async def import_preview(session: AsyncSession, data: dict[str, Any]) -> dict[str, Any]:
+    """Validate and report; writes nothing (plan F10.2)."""
+    report = await _analyze_import(session, data)
+    return {key: value for key, value in report.items() if not key.startswith("_")}
+
+
+async def import_data(
+    session: AsyncSession, data: dict[str, Any], *, policy: str = "skip"
+) -> dict[str, Any]:
+    """Apply an import transactionally (plan F10.2-10.4).
+
+    Default duplicate policy is skip; replace is an explicit choice and
+    respects revision checks. Identity is the task id only. On any problem
+    the whole import writes nothing.
+    """
+    if policy not in ("skip", "replace"):
+        raise ValueError("policy must be 'skip' or 'replace'")
+    analysis = await _analyze_import(session, data)
+    if not analysis["valid"]:
+        raise ValueError(
+            "Import file is invalid; nothing was written. Run import preview for the report"
+        )
+
+    # Stub agents without committing — one transaction for the whole import.
+    imported_tasks = [task for task, _ in analysis["_new"]]
+    imported_tasks += [task for task, _, _ in analysis["_duplicates"]]
+    agent_ids = sorted({task.agent_id for task in imported_tasks if task.agent_id})
+    for agent_id in agent_ids:
+        if await session.get(Agent, agent_id) is None:
+            prefix = agent_id.split("-")[0] if "-" in agent_id else agent_id
+            try:
+                kind = AgentType(prefix)
+            except ValueError:
+                kind = AgentType.chatgpt
+            session.add(Agent(id=agent_id, type=kind))
+
+    created = replaced = skipped = 0
+    for task, activity in analysis["_new"]:
+        session.add(task)
+        for row in activity:
+            session.add(row)
+        created += 1
+
+    for task, activity, existing in analysis["_duplicates"]:
+        if policy == "skip":
+            skipped += 1
+            continue
+        if task.revision < existing.revision:
+            raise ValueError(
+                f"Import aborted: task {task.id} is at revision {existing.revision}, "
+                f"newer than the imported {task.revision}; nothing was written"
+            )
+        for field in _REPLACE_FIELDS:
+            setattr(existing, field, getattr(task, field))
+        for row in await session.exec(
+            select(TaskActivity).where(col(TaskActivity.task_id) == existing.id)
+        ):
+            await session.delete(row)
+        for row in activity:
+            session.add(row)
+        session.add(existing)
+        replaced += 1
+
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise ValueError("Import failed a database constraint; nothing was written") from None
+    return {"policy": policy, "created": created, "replaced": replaced, "skipped": skipped}

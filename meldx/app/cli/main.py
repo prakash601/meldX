@@ -1,7 +1,9 @@
 """Typer commands backed by the shared REST API, locally or on Render."""
 
 import asyncio
+import json
 import os
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -82,16 +84,24 @@ def list_tasks(
     status: Annotated[TaskStatus | None, typer.Option(help="Filter by task status.")] = None,
     view: Annotated[
         str | None,
-        typer.Option(help="inbox|today|upcoming|open|overdue|missed|completed (owner timezone)."),
+        typer.Option(help="inbox|today|upcoming|open|overdue|missed|completed|archive (owner timezone)."),
     ] = None,
+    search: Annotated[
+        str | None, typer.Option("--search", "-q", help="Case-insensitive title/description text.")
+    ] = None,
+    priority: Annotated[Priority | None, typer.Option(help="Filter by priority.")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON for scripting.")] = False,
 ) -> None:
-    """List tasks and their current owners."""
+    """List tasks; combine view, search, and priority filters."""
     params: dict[str, Any] = {"today_only": today}
     if status is not None:
         params["status"] = status.value
     if view is not None:
         params["view"] = view
+    if search is not None:
+        params["q"] = search
+    if priority is not None:
+        params["priority"] = priority.value
     tasks = asyncio.run(_request("GET", "/api/tasks", params=params))
     if json_output:
         console.print_json(data=tasks)
@@ -184,6 +194,20 @@ def unsnooze(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> Non
 
 
 @app.command()
+def archive(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
+    """Hide a task from ordinary views; read-only until restored."""
+    task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/archive"))
+    console.print_json(data=task)
+
+
+@app.command()
+def restore(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
+    """Return an archived task to ordinary views, dates untouched."""
+    task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/restore"))
+    console.print_json(data=task)
+
+
+@app.command()
 def done(task_id: Annotated[UUID, typer.Argument(help="Task UUID.")]) -> None:
     """Complete a task (idempotent) and clear its lease."""
     task = asyncio.run(_request("POST", f"/api/tasks/{task_id}/complete"))
@@ -230,6 +254,40 @@ def edit(
         payload["priority"] = priority.value
     task = asyncio.run(_request("PATCH", f"/api/tasks/{task_id}", payload=payload))
     console.print_json(data=task)
+
+
+@app.command()
+def export() -> None:
+    """Print a full export document (tasks + history) as JSON."""
+    data = asyncio.run(_request("GET", "/api/export"))
+    console.print_json(data=data)
+
+
+@app.command("import")
+def import_tasks(
+    file: Annotated[Path, typer.Argument(help="Export JSON file to import.")],
+    policy: Annotated[
+        str, typer.Option(help="Duplicates: skip (default) or replace (explicit).")
+    ] = "skip",
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Preview only; nothing is written.")
+    ] = False,
+) -> None:
+    """Import an export file. Preview first; apply is transactional."""
+    if policy not in ("skip", "replace"):
+        error_console.print(Text("Policy must be 'skip' or 'replace'."))
+        raise typer.Exit(1)
+    try:
+        data = json.loads(file.read_text())
+    except OSError:
+        error_console.print(Text(f"Cannot read {file}."))
+        raise typer.Exit(1) from None
+    except ValueError:
+        error_console.print(Text(f"{file} is not valid JSON."))
+        raise typer.Exit(1) from None
+    endpoint = "/api/import/preview" if dry_run else "/api/import"
+    result = asyncio.run(_request("POST", endpoint, payload={"policy": policy, "data": data}))
+    console.print_json(data=result)
 
 
 @app.command()

@@ -89,6 +89,23 @@ def test_list_view_param(mock_api) -> None:
     assert result.exit_code == 0, result.output
 
 
+def test_list_search_and_priority_params(mock_api) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params) == {
+            "today_only": "false",
+            "view": "open",
+            "q": "rest",
+            "priority": "high",
+        }
+        return httpx.Response(200, json=[])
+
+    mock_api(handler)
+    result = runner.invoke(
+        cli.app, ["list", "--view", "open", "--search", "rest", "--priority", "high"]
+    )
+    assert result.exit_code == 0, result.output
+
+
 def test_today_prints_summary_sections(mock_api) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/tasks/summary"
@@ -125,6 +142,67 @@ def test_completed_uses_view_and_window(mock_api) -> None:
     assert "older work" in result.stdout
 
 
+def test_export_prints_document(mock_api) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/export"
+        return httpx.Response(
+            200, json={"schema_version": 1, "exported_at": "now", "tasks": []}
+        )
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["export"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["schema_version"] == 1
+
+
+def test_import_dry_run_posts_to_preview(mock_api, tmp_path) -> None:
+    document = {"schema_version": 1, "tasks": []}
+    source = tmp_path / "export.json"
+    source.write_text(json.dumps(document))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/import/preview"
+        assert json.loads(request.content) == {"policy": "skip", "data": document}
+        return httpx.Response(200, json={"valid": True, "counts": {"new": 0}})
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["import", str(source), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert '"valid": true' in result.stdout
+
+
+def test_import_apply_posts_to_apply_endpoint(mock_api, tmp_path) -> None:
+    document = {"schema_version": 1, "tasks": []}
+    source = tmp_path / "export.json"
+    source.write_text(json.dumps(document))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/import"
+        assert json.loads(request.content) == {"policy": "replace", "data": document}
+        return httpx.Response(200, json={"policy": "replace", "created": 0, "replaced": 1, "skipped": 0})
+
+    mock_api(handler)
+    result = runner.invoke(cli.app, ["import", str(source), "--policy", "replace"])
+    assert result.exit_code == 0, result.output
+
+
+def test_import_rejects_bad_policy_and_file(mock_api, tmp_path) -> None:
+    result = runner.invoke(cli.app, ["import", str(tmp_path / "missing.json")])
+    # Rich wraps stderr at the terminal width, so flatten before matching.
+    flattened = result.stderr.replace("\n", " ")
+    assert result.exit_code == 1 and "Cannot read" in flattened
+    bogus = tmp_path / "bogus.json"
+    bogus.write_text("not json")
+    result = runner.invoke(cli.app, ["import", str(bogus)])
+    flattened = result.stderr.replace("\n", " ")
+    assert result.exit_code == 1 and "not valid JSON" in flattened
+    good = tmp_path / "good.json"
+    good.write_text("{}")
+    result = runner.invoke(cli.app, ["import", str(good), "--policy", "merge"])
+    assert result.exit_code == 1 and "Policy must be" in result.stderr
+
+
 @pytest.mark.parametrize(
     "command,payload,path",
     [
@@ -136,6 +214,8 @@ def test_completed_uses_view_and_window(mock_api) -> None:
         (["unplan", TID], {"date": None}, f"/api/tasks/{TID}/plan"),
         (["snooze", TID, "tomorrow 9am"], {"until": "tomorrow 9am"}, f"/api/tasks/{TID}/snooze"),
         (["unsnooze", TID], None, f"/api/tasks/{TID}/unsnooze"),
+        (["archive", TID], None, f"/api/tasks/{TID}/archive"),
+        (["restore", TID], None, f"/api/tasks/{TID}/restore"),
     ],
 )
 def test_mutation_commands(mock_api, command, payload, path) -> None:
