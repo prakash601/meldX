@@ -4,6 +4,10 @@
 # Cron example (03:30 IST, keeps 30 daily backups):
 #   30 3 * * * /path/to/meldX/scripts/backup.sh >> /var/log/meldx-backup.log 2>&1
 #
+# VERSION RULE: use pg client tools matching (or older than) your server's
+# major version. A newer pg_dump emits settings (e.g. transaction_timeout)
+# that an older server rejects during restore.
+#
 # DATABASE_URL selects the database; BACKUP_DIR stores the dumps. Restore
 # with scripts/restore.sh. Rotate OWNER_BOOTSTRAP_SECRET independently —
 # backups contain task data only, never credentials or session tokens.
