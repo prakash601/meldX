@@ -40,18 +40,33 @@ jobs:
       - name: Docker and installed CLI smoke check
         env:
           API: http://localhost:8002
+          OWNER_BOOTSTRAP_SECRET: ci-smoke-secret
         run: |
           docker build -t meldx:ci .
           docker run --detach --name meldx-smoke --network host \
-            -e DATABASE_URL -e PORT=8002 -e RENDER_EXTERNAL_HOSTNAME=meldx.onrender.com meldx:ci
+            -e DATABASE_URL -e PORT=8002 -e RENDER_EXTERNAL_HOSTNAME=meldx.onrender.com \
+            -e ENABLE_AUTH=true -e OWNER_BOOTSTRAP_SECRET \
+            -e ENABLE_MCP=false -e ENABLE_AGENT_EXECUTION=false \
+            meldx:ci
           ready=0
           for attempt in $(seq 1 30); do
             if curl -fsS "$API/health"; then ready=1; break; fi
             sleep 1
           done
           if [ "$ready" != 1 ]; then docker logs meldx-smoke; exit 1; fi
+          # v0.0.4 protected smoke: unauthorized access fails...
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$API/api/tasks")
+          if [ "$code" != "401" ]; then echo "unauthorized list returned $code"; docker logs meldx-smoke; exit 1; fi
+          # ...the owner can log in through the form and use the board...
+          curl -fsS -c /tmp/smoke-cookies -X POST -d "secret=$OWNER_BOOTSTRAP_SECRET" -o /dev/null "$API/login"
+          curl -fsS -b /tmp/smoke-cookies "$API/" | grep -q "Today"
+          # ...and the CLI mints a token, works, and signs out.
+          echo "$OWNER_BOOTSTRAP_SECRET" | uv run meldx login --name ci-smoke
           uv run meldx add "CI CLI smoke" --due today --priority high
           uv run meldx list --today --json
+          uv run meldx logout
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$API/api/tasks")
+          if [ "$code" != "401" ]; then echo "token still valid after logout ($code)"; docker logs meldx-smoke; exit 1; fi
       - name: Container logs and cleanup
         if: always()
         run: |

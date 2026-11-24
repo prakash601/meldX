@@ -11,3 +11,17 @@ services:
         sync: false
       - key: LEASE_MINUTES
         value: 30
+      - key: OWNER_TIMEZONE
+        value: Asia/Kolkata
+      # v0.0.4 private-service gate: no unauthenticated task surface in prod.
+      - key: ENABLE_AUTH
+        value: "true"
+      - key: ENABLE_MCP
+        value: "false"
+      - key: ENABLE_AGENT_EXECUTION
+        value: "false"
+      # The owner bootstrap secret is a Render secret, never a file value.
+      - key: OWNER_BOOTSTRAP_SECRET
+        sync: false
+      # Nightly backups run the pg_dump script against DATABASE_URL; see
+      # docs/deploy.md for the schedule and the restore runbook.

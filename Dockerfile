@@ -10,6 +10,9 @@ RUN uv sync --locked --no-dev --no-install-project
 COPY meldx ./meldx
 COPY alembic ./alembic
 COPY alembic.ini ./
+COPY scripts ./scripts
 RUN uv sync --locked --no-dev
 # Migration failure prevents serving an incompatible schema. One worker shares SSE.
-CMD ["sh", "-c", "alembic upgrade head && exec uvicorn meldx.app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+# --proxy-headers lets the app see Render's forwarded https so session cookies
+# get the Secure attribute behind the TLS-terminating proxy.
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn meldx.app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --proxy-headers --forwarded-allow-ips '*'"]
