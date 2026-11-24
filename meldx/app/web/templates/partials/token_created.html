@@ -1,0 +1,9 @@
+<div class="rounded-xl border border-teal-900 bg-teal-950/40 p-4 max-w-3xl">
+  <p class="text-teal-300 font-medium">Credential created: {{ credential.name }}</p>
+  <p class="text-rose-300 text-sm mt-2">Copy this token now — it is shown exactly once:</p>
+  <code class="block mt-3 text-xs bg-slate-950 border border-slate-800 rounded-lg p-3 break-all select-all">{{ token }}</code>
+  <p class="text-slate-400 text-xs mt-3">
+    Use it as <code>MELDX_TOKEN</code> for the CLI, or an <code>Authorization: Bearer</code> header for API calls.
+    Run <code>meldx logout</code> to revoke.
+  </p>
+</div>

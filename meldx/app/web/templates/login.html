@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="max-w-md mx-auto mt-16 rounded-xl border border-slate-800 bg-slate-900 p-8">
+  <p class="text-teal-400 font-semibold tracking-widest mb-2">meldX</p>
+  <h1 class="text-2xl font-semibold">Owner login</h1>
+  <p class="text-slate-400 text-sm mt-2">Enter the owner bootstrap secret.</p>
+  {% if error %}<p role="alert" class="text-rose-300 text-sm mt-4">{{ error }}</p>{% endif %}
+  <form method="post" action="/login" class="mt-6 space-y-4">
+    <label class="block text-sm text-slate-400">Bootstrap secret
+      <input name="secret" type="password" required autocomplete="current-password"
+             class="mt-1 w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
+    </label>
+    <button class="w-full rounded-xl bg-teal-400 text-slate-950 font-semibold px-5 py-2">Sign in</button>
+  </form>
+</div>
+{% endblock %}

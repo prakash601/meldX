@@ -3,6 +3,7 @@
 import json
 from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 
 import httpx
 import pytest
@@ -287,6 +288,76 @@ def test_edit_conflict_exits_nonzero(mock_api) -> None:
     result = runner.invoke(cli.app, ["edit", TID, "--title", "renamed"])
     assert result.exit_code == 1
     assert "Stale revision" in result.stderr
+
+
+def test_login_stores_token_and_sends_bearer(mock_api, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("MELDX_TOKEN", raising=False)
+
+    def mint(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/auth/token"
+        assert json.loads(request.content) == {
+            "name": "cli",
+            "scopes": ["read", "write"],
+            "secret": "open-sesame",
+        }
+        return httpx.Response(200, json={"name": "cli", "token": "tok-123", "scopes": ["read", "write"]})
+
+    mock_api(mint)
+    result = runner.invoke(cli.app, ["login"], input="open-sesame\n")
+    assert result.exit_code == 0, result.output
+    stored = json.loads((tmp_path / ".meldx" / "credentials.json").read_text())
+    assert stored["token"] == "tok-123"
+    assert (tmp_path / ".meldx" / "credentials.json").stat().st_mode & 0o777 == 0o600
+
+    def bearer_used(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer tok-123"
+        return httpx.Response(200, json=[])
+
+    mock_api(bearer_used)
+    result = runner.invoke(cli.app, ["list"])
+    assert result.exit_code == 0, result.output
+
+
+def test_env_token_beats_stored_file(mock_api, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (tmp_path / ".meldx").mkdir()
+    (tmp_path / ".meldx" / "credentials.json").write_text(json.dumps({"token": "from-file"}))
+    monkeypatch.setenv("MELDX_TOKEN", "from-env")
+
+    def check(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer from-env"
+        return httpx.Response(200, json=[])
+
+    mock_api(check)
+    result = runner.invoke(cli.app, ["list"])
+    assert result.exit_code == 0, result.output
+
+
+def test_logout_revokes_and_removes_file(mock_api, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("MELDX_TOKEN", raising=False)
+    credentials = tmp_path / ".meldx" / "credentials.json"
+    credentials.parent.mkdir(parents=True)
+    credentials.write_text(json.dumps({"token": "tok-123"}))
+
+    def revoke(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/auth/revoke"
+        assert request.headers["authorization"] == "Bearer tok-123"
+        return httpx.Response(200, json={"revoked": True, "name": "cli"})
+
+    mock_api(revoke)
+    result = runner.invoke(cli.app, ["logout"])
+    assert result.exit_code == 0, result.output
+    assert "revoked" in result.stdout
+    assert not credentials.exists()
+
+
+def test_logout_without_stored_credential(mock_api, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("MELDX_TOKEN", raising=False)
+    result = runner.invoke(cli.app, ["logout"])
+    assert result.exit_code == 1 and "No stored credential" in result.stderr
 
 
 def test_unreachable_and_invalid_responses(mock_api) -> None:

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
+import click
 import httpx
 import typer
 from rich.console import Console
@@ -20,19 +21,41 @@ console = Console()
 error_console = Console(stderr=True)
 
 
+def _credential_path() -> Path:
+    return Path.home() / ".meldx" / "credentials.json"
+
+
+def _bearer_token() -> str | None:
+    """Env first, then the credentials file — never a shell argument."""
+    token = os.environ.get("MELDX_TOKEN")
+    if token:
+        return token
+    try:
+        data = json.loads(_credential_path().read_text())
+    except (OSError, ValueError):
+        return None
+    stored = data.get("token")
+    return stored if isinstance(stored, str) else None
+
+
 async def _request(
     method: str,
     path: str,
     *,
     payload: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> Any:
     try:
         url = httpx.URL(os.environ.get("API", "http://localhost:8000"))
         if url.scheme not in {"http", "https"} or not url.host or url.userinfo:
             raise ValueError("API must be an absolute HTTP(S) URL without credentials.")
+        headers = dict(extra_headers or {})
+        token = _bearer_token()
+        if token:
+            headers.setdefault("Authorization", f"Bearer {token}")
         async with httpx.AsyncClient(base_url=str(url).rstrip("/"), timeout=60) as client:
-            response = await client.request(method, path, json=payload, params=params)
+            response = await client.request(method, path, json=payload, params=params, headers=headers)
     except (httpx.InvalidURL, ValueError):
         error_console.print(Text("Invalid API URL. Set API to the meldX server's HTTP(S) URL."))
         raise typer.Exit(1) from None
@@ -288,6 +311,48 @@ def import_tasks(
     endpoint = "/api/import/preview" if dry_run else "/api/import"
     result = asyncio.run(_request("POST", endpoint, payload={"policy": policy, "data": data}))
     console.print_json(data=result)
+
+
+@app.command()
+def login(
+    name: Annotated[str, typer.Option(help="Credential name.")] = "cli",
+    read_only: Annotated[bool, typer.Option(help="Mint a read-only credential.")] = False,
+) -> None:
+    """Sign in with the owner bootstrap secret; stores a revocable token."""
+    secret = click.prompt("Owner bootstrap secret", hide_input=True)
+    scopes = ["read"] if read_only else ["read", "write"]
+    result = asyncio.run(
+        _request(
+            "POST",
+            "/api/auth/token",
+            payload={"name": name, "scopes": scopes, "secret": secret},
+        )
+    )
+    token = result.get("token")
+    if not isinstance(token, str):
+        error_console.print(Text("The server did not return a token."))
+        raise typer.Exit(1)
+    path = _credential_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"url": os.environ.get("API", "http://localhost:8000"), "token": token}))
+    path.chmod(0o600)
+    console.print(f"Stored credential [bold]{result['name']}[/bold] in {path}")
+    console.print(Text("Run `meldx logout` to revoke it. The token is shown only once."))
+
+
+@app.command()
+def logout() -> None:
+    """Revoke the stored credential and remove the local file."""
+    token = _bearer_token()
+    if not token:
+        error_console.print(Text("No stored credential found."))
+        raise typer.Exit(1)
+    asyncio.run(_request("POST", "/api/auth/revoke"))
+    try:
+        _credential_path().unlink()
+    except OSError:
+        pass
+    console.print(Text("Credential revoked and removed."))
 
 
 @app.command()

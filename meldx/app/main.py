@@ -12,13 +12,15 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from meldx.app import auth as authz
 from meldx.app import bus, dates
 from meldx.app.api import agents, events, tasks
 from meldx.app.db import check_db, ensure_schema, get_engine, get_session, is_sqlite
 from meldx.app.mcp.tools import mcp as mcp_server
-from meldx.app.models import TaskImport
+from meldx.app.models import Credential, TaskImport, TokenMint
 from meldx.app.services import tasks as svc
 from meldx.app.web import router as web
 
@@ -97,6 +99,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger = logging.getLogger("meldx")
     get_engine()  # fail fast on bad DATABASE_URL
     dates.owner_zone()  # fail fast on a bad OWNER_TIMEZONE (F01.5)
+    if authz.bootstrap_secret() is None:
+        logger.warning(
+            "ENABLE_AUTH is on but OWNER_BOOTSTRAP_SECRET is missing; auth is a no-op. "
+            "Set the bootstrap secret before exposing the service.",
+            extra={"event": "auth.misconfigured", "status": "warn"},
+        )
+    elif not getattr(app.state, "auth", False):
+        logger.warning(
+            "authentication is DISABLED: safe only for loopback development. "
+            "Set ENABLE_AUTH=true before any non-local exposure.",
+            extra={"event": "auth.disabled", "status": "warn"},
+        )
     if is_sqlite():
         # No server to start: create the schema the Alembic Postgres migration
         # cannot create here, and say plainly which guarantee is not covered.
@@ -126,10 +140,16 @@ def _flag(env: str, override: bool | None) -> bool:
 
 
 def create_app(
-    *, enable_mcp: bool | None = None, enable_agent_execution: bool | None = None
+    *,
+    enable_mcp: bool | None = None,
+    enable_agent_execution: bool | None = None,
+    enable_auth: bool | None = None,
 ) -> FastAPI:
     mcp_enabled = _flag("ENABLE_MCP", enable_mcp)
     execution_enabled = _flag("ENABLE_AGENT_EXECUTION", enable_agent_execution)
+    auth_enabled = _flag("ENABLE_AUTH", enable_auth)
+    if auth_enabled and authz.bootstrap_secret() is None:
+        raise ValueError("ENABLE_AUTH requires OWNER_BOOTSTRAP_SECRET to be set")
     mcp_app = (
         mcp_server.streamable_http_app(transport_security=mcp_transport_security())
         if mcp_enabled
@@ -143,6 +163,8 @@ def create_app(
     )
     app.state.mcp_app = mcp_app
     app.state.agent_execution = execution_enabled
+    app.state.auth = auth_enabled
+    app.state.login_limiter = authz.LoginRateLimiter.from_env()
     app.router.lifespan_context = lifespan
 
     @app.get(
@@ -178,7 +200,28 @@ def create_app(
             },
         }
 
-    SessionDep = Annotated[AsyncSession, Depends(get_session)]
+    # v0.0.4 (plan §6.5): every task-data surface requires the owner. GETs
+    # need the read scope, mutations the write scope; a web session carries
+    # both. /health and /api/settings stay public (no task data, no secrets).
+    async def require_api_auth(
+        request: Request, session: Annotated[AsyncSession, Depends(get_session)]
+    ) -> None:
+        if not auth_enabled:
+            return
+        header = request.headers.get("authorization", "")
+        if header.startswith("Bearer "):
+            credential = await authz.verify_bearer_token(session, header[7:].strip())
+            if credential is None:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+            needed = (
+                authz.READ_SCOPE if request.method in {"GET", "HEAD", "OPTIONS"} else authz.WRITE_SCOPE
+            )
+            if needed not in credential.scopes:
+                raise HTTPException(status_code=403, detail=f"Credential lacks the {needed} scope")
+            return
+        cookie = request.cookies.get(authz.SESSION_COOKIE)
+        if await authz.verify_session_token(session, cookie) is None:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
     @app.get(
         "/api/export",
@@ -188,7 +231,10 @@ def create_app(
         "every task — archived included — with stable IDs, scheduling fields, and "
         "the durable activity history. No credentials exist in task data.",
     )
-    async def export_tasks(session: SessionDep) -> dict[str, Any]:
+    async def export_tasks(
+        session: Annotated[AsyncSession, Depends(get_session)],
+        _auth: Annotated[None, Depends(require_api_auth)],
+    ) -> dict[str, Any]:
         return await svc.export_data(session)
 
     @app.post(
@@ -200,7 +246,9 @@ def create_app(
         "nothing. Identity is the task id — never a title guess.",
     )
     async def import_preview(
-        payload: TaskImport, session: SessionDep
+        payload: TaskImport,
+        session: Annotated[AsyncSession, Depends(get_session)],
+        _auth: Annotated[None, Depends(require_api_auth)],
     ) -> dict[str, Any]:
         return await svc.import_preview(session, payload.data)
 
@@ -212,7 +260,11 @@ def create_app(
         "`replace` is an explicit choice and refuses imports whose revision is "
         "older than the existing row. Invalid files write nothing — preview first.",
     )
-    async def import_tasks(payload: TaskImport, session: SessionDep) -> dict[str, Any]:
+    async def import_tasks(
+        payload: TaskImport,
+        session: Annotated[AsyncSession, Depends(get_session)],
+        _auth: Annotated[None, Depends(require_api_auth)],
+    ) -> dict[str, Any]:
         return await svc.import_data(session, payload.data, policy=payload.policy)
 
     @app.exception_handler(ValueError)
@@ -246,14 +298,124 @@ def create_app(
             content["current_task"] = exc.task.model_dump(mode="json")
         return JSONResponse(status_code=code, content=content)
 
+    api_auth = [Depends(require_api_auth)]
+
+    @app.post(
+        "/api/auth/token",
+        tags=["settings"],
+        summary="Mint a CLI credential",
+        description="Owner-only, rate-limited like the web login: verifies the "
+        "bootstrap secret from the request body (never a URL) and returns the raw "
+        "token exactly once — only its hash is stored. Scopes start at read/write.",
+    )
+    async def mint_token(
+        payload: TokenMint,
+        request: Request,
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict[str, Any]:
+        if not auth_enabled:
+            raise HTTPException(status_code=400, detail="Authentication is disabled on this deployment")
+        limiter = request.app.state.login_limiter
+        key = request.client.host if request.client else "unknown"
+        if limiter.locked(key):
+            raise HTTPException(
+                status_code=429, detail="Too many failed attempts. Wait a bit and try again."
+            )
+        if not authz.verify_bootstrap_secret(payload.secret):
+            limiter.record_failure(key)
+            raise HTTPException(status_code=401, detail="That secret is not correct.")
+        limiter.reset(key)
+        raw, row = await authz.create_credential(session, name=payload.name, scopes=payload.scopes)
+        return {"id": str(row.id), "name": row.name, "scopes": row.scopes, "token": raw}
+
+    async def require_session_only(
+        request: Request, session: Annotated[AsyncSession, Depends(get_session)]
+    ) -> None:
+        """Token management is the owner's: session cookie, not a bearer."""
+        if not auth_enabled:
+            return
+        cookie = request.cookies.get(authz.SESSION_COOKIE)
+        if await authz.verify_session_token(session, cookie) is None:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    @app.get(
+        "/api/tokens",
+        tags=["settings"],
+        summary="List CLI credentials",
+        description="Every credential with name, scopes, and revocation state. "
+        "Token hashes are never returned. Requires the owner's web session.",
+    )
+    async def list_tokens(
+        session: Annotated[AsyncSession, Depends(get_session)],
+        _auth: Annotated[None, Depends(require_session_only)],
+    ) -> list[dict[str, Any]]:
+        rows = list((await session.exec(select(Credential))).all())
+        return [
+            {
+                "id": str(row.id),
+                "name": row.name,
+                "scopes": row.scopes,
+                "created_at": row.created_at.isoformat(),
+                "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
+                "revoked_at": row.revoked_at.isoformat() if row.revoked_at else None,
+            }
+            for row in rows
+        ]
+
+    @app.post(
+        "/api/tokens/{credential_id}/revoke",
+        tags=["settings"],
+        summary="Revoke a CLI credential",
+        description="Revocation is immediate: the credential stops authenticating "
+        "and open SSE streams close within one recheck interval. Requires the "
+        "owner's web session.",
+    )
+    async def revoke_token(
+        credential_id: str,
+        session: Annotated[AsyncSession, Depends(get_session)],
+        _auth: Annotated[None, Depends(require_session_only)],
+    ) -> dict[str, Any]:
+        row = await authz.revoke_credential(session, credential_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="No credential with that id")
+        return {
+            "id": str(row.id),
+            "name": row.name,
+            "revoked_at": row.revoked_at.isoformat() if row.revoked_at else None,
+        }
+
+    @app.post(
+        "/api/auth/revoke",
+        tags=["settings"],
+        summary="Revoke the presented credential",
+        description="Bearer-authenticated self-revoke, so `meldx logout` can "
+        "revoke the exact credential it uses.",
+    )
+    async def revoke_self(
+        request: Request,
+        session: Annotated[AsyncSession, Depends(get_session)],
+        _auth: Annotated[None, Depends(require_api_auth)],
+    ) -> dict[str, Any]:
+        if not auth_enabled:
+            raise HTTPException(status_code=400, detail="Authentication is disabled on this deployment")
+        header = request.headers.get("authorization", "")
+        credential = await authz.verify_bearer_token(session, header[7:].strip())
+        if credential is None:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        revoked = await authz.revoke_credential(session, str(credential.id))
+        assert revoked is not None  # present and not-yet-revoked a moment ago
+        return {"revoked": True, "name": revoked.name}
+
+
     # API routes BEFORE the "/" mount: a root mount matches every path,
     # so anything registered after it would be unreachable.
-    app.include_router(events.router, prefix="/api")
-    app.include_router(tasks.router, prefix="/api")
+    app.include_router(events.router, prefix="/api", dependencies=api_auth)
+    app.include_router(tasks.router, prefix="/api", dependencies=api_auth)
     if execution_enabled:
-        app.include_router(tasks.execution_router, prefix="/api")
-    app.include_router(agents.router, prefix="/api")
+        app.include_router(tasks.execution_router, prefix="/api", dependencies=api_auth)
+    app.include_router(agents.router, prefix="/api", dependencies=api_auth)
     app.include_router(web.router)
+    app.include_router(web.auth_router)
     if execution_enabled:
         app.include_router(web.execution_router)
 

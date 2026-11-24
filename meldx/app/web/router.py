@@ -10,22 +10,52 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Form, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
+from starlette.responses import Response
 
+from meldx.app import auth as authz
 from meldx.app import dates
 from meldx.app.db import get_session
-from meldx.app.models import Priority, Task
+from meldx.app.models import Credential, Priority, Task
 from meldx.app.services import tasks as svc
 
-router = APIRouter()
+Session = Annotated[AsyncSession, Depends(get_session)]
+
+
+async def require_web_session(request: Request, session: Session) -> None:
+    """Web pages need a valid owner session; anything else bounces to login."""
+    if not getattr(request.app.state, "auth", False):
+        return
+    cookie = request.cookies.get(authz.SESSION_COOKIE)
+    if await authz.verify_session_token(session, cookie) is None:
+        raise HTTPException(status_code=303, detail="login required", headers={"Location": "/login"})
+
+
+async def require_csrf(request: Request) -> None:
+    """Cookie-authenticated writes are CSRF-protected by double submit."""
+    if not getattr(request.app.state, "auth", False):
+        return
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return
+    if not authz.csrf_ok(
+        request.cookies.get(authz.CSRF_COOKIE), request.headers.get("x-csrf-token")
+    ):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
+
+
+router = APIRouter(dependencies=[Depends(require_web_session), Depends(require_csrf)])
 # Agent-execution form action (claim): registered only when
 # ENABLE_AGENT_EXECUTION is set — see main.create_app (product plan §6.1).
-execution_router = APIRouter()
+execution_router = APIRouter(
+    dependencies=[Depends(require_web_session), Depends(require_csrf)]
+)
+# Public: the login/logout flows themselves (product plan §6.5).
+auth_router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
-Session = Annotated[AsyncSession, Depends(get_session)]
 
 NAV_VIEWS = ("today", "inbox", "upcoming", "open", "completed", "archive")
 
@@ -103,6 +133,8 @@ async def board(
             "snoozed_ids": snoozed_ids,
             "overdue_ids": overdue_ids,
             "agent_execution": getattr(request.app.state, "agent_execution", False),
+            "auth_enabled": getattr(request.app.state, "auth", False),
+            "csrf_token": request.cookies.get(authz.CSRF_COOKIE),
         },
     )
 
@@ -355,6 +387,8 @@ async def task_detail(request: Request, task_id: str, session: Session) -> HTMLR
             "activity": history["activity"],
             "view": "detail",
             "agent_execution": getattr(request.app.state, "agent_execution", False),
+            "auth_enabled": getattr(request.app.state, "auth", False),
+            "csrf_token": request.cookies.get(authz.CSRF_COOKIE),
         },
     )
 
@@ -479,3 +513,135 @@ async def complete_task(
 ) -> HTMLResponse:
     await svc.complete_task(session, task_id=task_id)
     return await board(request, session, "partials/board.html", view=view)
+
+
+def _is_https(request: Request) -> bool:
+    return request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+
+
+@router.get(
+    "/tokens",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="CLI credentials page",
+    description="Create, inspect, and revoke CLI bearer credentials. Hashes are "
+    "never shown; a raw token appears exactly once at creation.",
+)
+async def tokens_page(request: Request, session: Session) -> HTMLResponse:
+    rows = list(
+        (await session.exec(select(Credential).order_by(col(Credential.created_at)))).all()
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="tokens.html",
+        context={
+            "credentials": rows,
+            "view": "tokens",
+            "auth_enabled": getattr(request.app.state, "auth", False),
+            "csrf_token": request.cookies.get(authz.CSRF_COOKIE),
+        },
+    )
+
+
+@router.post(
+    "/tokens/create",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Create CLI credential (form)",
+    description="Mints a scoped credential and shows the raw token exactly once.",
+)
+async def tokens_create(
+    request: Request,
+    session: Session,
+    name: Annotated[str, Form(min_length=1, max_length=100)] = "cli",
+    read_scope: Annotated[bool, Form()] = True,
+    write_scope: Annotated[bool, Form()] = True,
+) -> HTMLResponse:
+    scopes = [scope for scope, wanted in (("read", read_scope), ("write", write_scope)) if wanted]
+    raw, row = await authz.create_credential(session, name=name, scopes=scopes or ["read"])
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/token_created.html",
+        context={"token": raw, "credential": row},
+    )
+
+
+@router.post(
+    "/tokens/{credential_id}/revoke",
+    response_class=HTMLResponse,
+    tags=["web"],
+    summary="Revoke CLI credential (form)",
+    description="Immediate revocation; open SSE streams close within one recheck.",
+)
+async def tokens_revoke(request: Request, credential_id: str, session: Session) -> HTMLResponse:
+    await authz.revoke_credential(session, credential_id)
+    rows = list(
+        (await session.exec(select(Credential).order_by(col(Credential.created_at)))).all()
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/tokens_list.html",
+        context={"credentials": rows},
+    )
+
+
+async def _already_logged_in(request: Request, session: Session) -> bool:
+    if not getattr(request.app.state, "auth", False):
+        return True
+    cookie = request.cookies.get(authz.SESSION_COOKIE)
+    if not cookie:
+        return False
+    return await authz.verify_session_token(session, cookie) is not None
+
+
+@auth_router.get("/login", response_class=HTMLResponse, include_in_schema=False)
+async def login_page(request: Request, session: Session) -> Response:
+    if await _already_logged_in(request, session):
+        return RedirectResponse("/", status_code=303)
+    return templates.TemplateResponse(
+        request=request, name="login.html", context={"error": None}
+    )
+
+
+@auth_router.post("/login", response_class=HTMLResponse, include_in_schema=False)
+async def login_submit(
+    request: Request, session: Session, secret: Annotated[str, Form()] = ""
+) -> Response:
+    if not getattr(request.app.state, "auth", False):
+        return RedirectResponse("/", status_code=303)
+    limiter = request.app.state.login_limiter
+    key = request.client.host if request.client else "unknown"
+    if limiter.locked(key):
+        return templates.TemplateResponse(
+            request=request,
+            name="login.html",
+            status_code=429,
+            context={"error": "Too many failed attempts. Wait a bit and try again."},
+        )
+    if not authz.verify_bootstrap_secret(secret):
+        limiter.record_failure(key)
+        return templates.TemplateResponse(
+            request=request,
+            name="login.html",
+            status_code=401,
+            context={"error": "That secret is not correct."},
+        )
+    limiter.reset(key)
+    raw, expires = await authz.create_session(session)
+    response = RedirectResponse("/", status_code=303)
+    secure = _is_https(request)
+    response.set_cookie(
+        authz.SESSION_COOKIE, raw, httponly=True, samesite="lax", secure=secure, expires=expires
+    )
+    response.set_cookie(authz.CSRF_COOKIE, authz.new_csrf_token(), samesite="lax", secure=secure)
+    return response
+
+
+@auth_router.post("/logout", include_in_schema=False)
+async def logout(request: Request, session: Session) -> RedirectResponse:
+    if getattr(request.app.state, "auth", False):
+        await authz.revoke_session_token(session, request.cookies.get(authz.SESSION_COOKIE))
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(authz.SESSION_COOKIE)
+    response.delete_cookie(authz.CSRF_COOKIE)
+    return response
